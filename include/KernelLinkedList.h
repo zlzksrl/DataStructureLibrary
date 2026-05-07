@@ -50,7 +50,7 @@
 #include <stddef.h>
 
 #ifdef __cplusplus
- extern "C" {
+extern "C" {
 #endif
 
 
@@ -90,6 +90,8 @@
  * @param       member: 成员在宿主结构体中的名称
  * @return      指向宿主结构体的指针 (type*)
  * @warning     依赖 GCC typeof 扩展，需使用 GCC 兼容编译器
+ * @note        如需移植到不支持 typeof 的编译器，可使用 C11 _Generic 或
+ *              直接强制类型转换替代
  */
 #ifndef container_of
 #define container_of(ptr, type, member) ({                          \
@@ -175,14 +177,14 @@ static inline void INIT_LIST_HEAD(struct list_head *list)
 /*     内部辅助函数 (Internal Helper)                                  */
 /*                                                                    */
 /*  说明:                                                              */
-/*    __list_add / __list_del 为底层指针操作函数，                      */
+/*    list_add_raw / list_del_raw 为底层指针操作函数，                  */
 /*    不做参数校验，仅供 list_add / list_del 等公共API内部调用。         */
 /*    外部不应直接调用这些函数。                                        */
 /*                                                                    */
 /* ================================================================== */
 
 /**
- * @func        __list_add
+ * @func        list_add_raw
  * @brief       在两个已知节点之间插入新节点（内部辅助函数）
  * @details     将 new_node 插入到 prev 和 next 之间。
  *              调用前需保证 prev->next == next 且 next->prev == prev。
@@ -191,9 +193,9 @@ static inline void INIT_LIST_HEAD(struct list_head *list)
  * @param[in]   next:     后继节点
  * @warning     仅供内部调用，不做参数校验
  */
-static inline void __list_add(struct list_head *new_node,
-                              struct list_head *prev,
-                              struct list_head *next)
+static inline void list_add_raw(struct list_head *new_node,
+                                struct list_head *prev,
+                                struct list_head *next)
 {
     next->prev = new_node;
     new_node->next = next;
@@ -202,7 +204,7 @@ static inline void __list_add(struct list_head *new_node,
 }
 
 /**
- * @func        __list_del
+ * @func        list_del_raw
  * @brief       通过前驱/后继指针删除节点（内部辅助函数）
  * @details     将 prev->next 指向 next，next->prev 指向 prev，
  *              使中间节点从链表中脱离。
@@ -210,7 +212,7 @@ static inline void __list_add(struct list_head *new_node,
  * @param[in]   next: 待删除节点的后继
  * @warning     仅供内部调用，不修改被删除节点的指针
  */
-static inline void __list_del(struct list_head *prev, struct list_head *next)
+static inline void list_del_raw(struct list_head *prev, struct list_head *next)
 {
     next->prev = prev;
     prev->next = next;
@@ -244,7 +246,7 @@ static inline void __list_del(struct list_head *prev, struct list_head *next)
  */
 static inline void list_add(struct list_head *new_node, struct list_head *head)
 {
-    __list_add(new_node, head, head->next);
+    list_add_raw(new_node, head, head->next);
 }
 
 /**
@@ -262,7 +264,7 @@ static inline void list_add(struct list_head *new_node, struct list_head *head)
  */
 static inline void list_add_tail(struct list_head *new_node, struct list_head *head)
 {
-    __list_add(new_node, head->prev, head);
+    list_add_raw(new_node, head->prev, head);
 }
 
 
@@ -280,9 +282,29 @@ static inline void list_add_tail(struct list_head *new_node, struct list_head *h
 /* ================================================================== */
 
 /**
+ * @macro       LIST_POISON1
+ * @brief       list_del 后 next 指针的毒值
+ * @details     默认为 NULL。可在包含本头文件前定义为非零值（如 (void*)0x100）
+ *              以便在调试时识别已删除节点的野指针访问。
+ */
+#ifndef LIST_POISON1
+#define LIST_POISON1  ((struct list_head *)0)
+#endif
+
+/**
+ * @macro       LIST_POISON2
+ * @brief       list_del 后 prev 指针的毒值
+ * @details     默认为 NULL。可在包含本头文件前定义为非零值（如 (void*)0x200）
+ *              以便在调试时识别已删除节点的野指针访问。
+ */
+#ifndef LIST_POISON2
+#define LIST_POISON2  ((struct list_head *)0)
+#endif
+
+/**
  * @func        list_del
  * @brief       从链表中删除节点
- * @details     将 entry 从所在链表中移除，并将 entry 的 prev/next 置为 NULL。
+ * @details     将 entry 从所在链表中移除，并将 entry 的 prev/next 置为毒值。
  *              删除后 entry 不属于任何链表，不可再对其使用链表操作。
  * @param[in]   entry: 待删除的节点指针
  * @warning     删除后需由调用者负责释放 entry 所属宿主结构体的内存
@@ -295,9 +317,9 @@ static inline void list_add_tail(struct list_head *new_node, struct list_head *h
  */
 static inline void list_del(struct list_head *entry)
 {
-    __list_del(entry->prev, entry->next);
-    entry->next = NULL;
-    entry->prev = NULL;
+    list_del_raw(entry->prev, entry->next);
+    entry->next = LIST_POISON1;
+    entry->prev = LIST_POISON2;
 }
 
 /**
@@ -315,7 +337,7 @@ static inline void list_del(struct list_head *entry)
  */
 static inline void list_del_init(struct list_head *entry)
 {
-    __list_del(entry->prev, entry->next);
+    list_del_raw(entry->prev, entry->next);
     INIT_LIST_HEAD(entry);
 }
 
@@ -347,6 +369,9 @@ static inline void list_del_init(struct list_head *entry)
 static inline void list_replace(struct list_head *old_node,
                                 struct list_head *new_node)
 {
+    if (old_node == new_node) {
+        return;
+    }
     new_node->next = old_node->next;
     new_node->next->prev = new_node;
     new_node->prev = old_node->prev;
@@ -380,12 +405,18 @@ static inline void list_replace_init(struct list_head *old_node,
 static inline void list_swap(struct list_head *entry1,
                              struct list_head *entry2)
 {
-    struct list_head *pos = entry2->prev;
+    struct list_head *pos;
 
+    if (entry1 == entry2) {
+        return;
+    }
+
+    pos = entry2->prev;
     list_del(entry2);
     list_add(entry2, entry1);
-    if (pos == entry1)
+    if (pos == entry1) {
         pos = entry2;
+    }
     list_del(entry1);
     list_add(entry1, pos);
 }
@@ -399,7 +430,7 @@ static inline void list_swap(struct list_head *entry1,
  */
 static inline void list_move(struct list_head *list, struct list_head *head)
 {
-    __list_del(list->prev, list->next);
+    list_del_raw(list->prev, list->next);
     list_add(list, head);
 }
 
@@ -413,7 +444,7 @@ static inline void list_move(struct list_head *list, struct list_head *head)
 static inline void list_move_tail(struct list_head *list,
                                   struct list_head *head)
 {
-    __list_del(list->prev, list->next);
+    list_del_raw(list->prev, list->next);
     list_add_tail(list, head);
 }
 
@@ -518,10 +549,10 @@ static inline int list_is_head(const struct list_head *list,
  * @retval      >=0: 节点数量
  * @warning     时间复杂度 O(n)，频繁调用可能影响性能
  */
-static inline int list_count_nodes(const struct list_head *head)
+static inline unsigned int list_count_nodes(const struct list_head *head)
 {
     const struct list_head *pos;
-    int count = 0;
+    unsigned int count = 0;
 
     for (pos = head->next; pos != head; pos = pos->next)
         count++;
@@ -550,15 +581,17 @@ static inline int list_count_nodes(const struct list_head *head)
  * @func        list_splice
  * @brief       将 list 链表拼接到 head 链表的头部
  * @details     将 list 链表中的所有节点插入到 head 之后。
- *              拼接后 list 链表头变为未使用状态（但仍指向原节点）。
- * @param[in]   list: 待拼接的链表头（其节点将被合并到 head 链表）
+ *              拼接后 list 链表头变为未使用状态（但仍指向原节点），
+ *              调用者不应再使用 list 作为有效链表头，建议使用
+ *              list_splice_init 以自动重新初始化 list。
+ * @param[in]   list: 待拼接的链表头（其节点将被合并到 head 链表），不能为 NULL
  * @param[in]   head: 目标链表头
  * @warning     如果 list 为空，不做任何操作
  */
 static inline void list_splice(const struct list_head *list,
                                struct list_head *head)
 {
-    if (!list_empty(list)) {
+    if (list != NULL && !list_empty(list)) {
         struct list_head *first = list->next;
         struct list_head *last  = list->prev;
         struct list_head *at    = head->next;
@@ -576,14 +609,16 @@ static inline void list_splice(const struct list_head *list,
  * @brief       将 list 链表拼接到 head 链表的尾部
  * @details     将 list 链表中的所有节点插入到 head 之前。
  *              等价于将 list 的节点追加到 head 链表的末尾。
- * @param[in]   list: 待拼接的链表头
+ *              拼接后 list 链表头变为未使用状态，建议使用
+ *              list_splice_tail_init 以自动重新初始化 list。
+ * @param[in]   list: 待拼接的链表头，不能为 NULL
  * @param[in]   head: 目标链表头
  * @warning     如果 list 为空，不做任何操作
  */
 static inline void list_splice_tail(const struct list_head *list,
                                     struct list_head *head)
 {
-    if (!list_empty(list)) {
+    if (list != NULL && !list_empty(list)) {
         struct list_head *first = list->next;
         struct list_head *last  = list->prev;
         struct list_head *at    = head->prev;
@@ -700,12 +735,14 @@ static inline void list_cut_before(struct list_head *list,
                                    struct list_head *head,
                                    struct list_head *entry)
 {
+    struct list_head *old_last;
+
     if (head->next == entry) {
         INIT_LIST_HEAD(list);
         return;
     }
 
-    struct list_head *old_last = entry->prev;
+    old_last = entry->prev;
 
     list->next       = entry;
     list->prev       = head->prev;
@@ -951,6 +988,7 @@ static inline void list_cut_before(struct list_head *list,
  * @param       member: list_head 在宿主结构体中的成员名
  * @return      有效的起始 pos 或第一个 entry
  */
+/* 注意: 使用了 GCC 条件表达式扩展 (?: 省略中间操作数) */
 #define list_prepare_entry(pos, head, member) \
     ((pos) ? : list_entry(head, typeof(*(pos)), member))
 
@@ -1065,7 +1103,7 @@ static inline void list_cut_before(struct list_head *list,
 
 
 #ifdef __cplusplus
- }
+}
 #endif
 
 #endif

@@ -10,7 +10,7 @@ USERNAME           = zlzksrl
 INSTALLBOARD       = root@192.168.1.6:/usr/zlzksrl/app/$(TARGET_Name)/
 
 # 编译选项
-CFLAGS  = -g
+CFLAGS  = -g -Wall -Wextra
 
 # 源文件
 MAIN_SOURCE = main.c
@@ -46,17 +46,17 @@ app: $(MAIN_OBJ)
 	@chmod 755 $(TARGET)
 
 # main.o 编译
-%.o: %.c
+%.o: %.c ../include/KernelLinkedList.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ==============================================================================
 # 清理
 clean:
-	rm -f *.bin  -rf
-	rm -f *.o  -rf
+	rm -f *.bin
+	rm -f *.o
 	rm -f $(TARGET)
 	rm -f $(PROJECT_INFO)
 	
 # 安装可执行文件
 install:app
-	scp $(TARGET) $(INSTALLBOARD);
+	scp $(TARGET) $(INSTALLBOARD)
