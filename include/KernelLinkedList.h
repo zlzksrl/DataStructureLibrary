@@ -466,7 +466,8 @@ static inline void list_move_tail(struct list_head *list,
 /**
  * @func        list_is_first
  * @brief       判断节点是否为链表的第一个节点
- * @details     检查 list 是否紧接在 head 之后（即 head->next == list）。
+ * @details     检查 list 的前驱是否为 head（即 list->prev == head），
+ *              等价于判断 list 是否紧接在 head 之后（即 head->next == list）。
  * @param[in]   list: 待检查的节点
  * @param[in]   head: 链表头
  * @return      int
@@ -545,7 +546,7 @@ static inline int list_is_head(const struct list_head *list,
  * @brief       统计链表中的节点数量
  * @details     从 head->next 开始遍历，直到回到 head，统计节点个数。
  * @param[in]   head: 链表头
- * @return      int 链表中的节点数量
+ * @return      unsigned int 链表中的节点数量
  * @retval      >=0: 节点数量
  * @warning     时间复杂度 O(n)，频繁调用可能影响性能
  */
@@ -870,7 +871,9 @@ static inline void list_cut_before(struct list_head *list,
 /*    list_for_each_entry_safe_reverse - 安全反向遍历宿主结构体（可删除） */
 /*    list_for_each_entry_continue - 从当前节点继续正向遍历               */
 /*    list_for_each_entry_continue_reverse - 从当前节点继续反向遍历       */
+/*    list_for_each_entry_continue_safe - 从当前节点安全继续正向遍历      */
 /*    list_for_each_entry_from    - 从指定节点开始遍历                    */
+/*    list_for_each_entry_from_safe - 从指定节点安全正向遍历（可删除）    */
 /*    list_prepare_entry          - 准备 entry 用于 continue 类遍历       */
 /*                                                                    */
 /*  注意:                                                              */

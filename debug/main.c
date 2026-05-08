@@ -721,7 +721,8 @@ static void test_static_init(void)
  * @brief        测试安全遍历和删除操作
  * @details      测试 list_for_each_entry_safe, list_for_each_entry_safe_reverse,
  *               list_for_each_safe, list_for_each_prev_safe,
- *               list_for_each_entry_continue, list_for_each_entry_from
+ *               list_for_each_entry_continue, list_for_each_entry_from,
+ *               list_next_entry, list_prev_entry
  */
 static void test_safe_iteration(void)
 {
