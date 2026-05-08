@@ -99,10 +99,22 @@ extern "C" {
 /*                                                                    */
 /* ================================================================== */
 
-/** 红黑树节点颜色常量: 黑色 */
+/**
+ * @macro       REDBLACKTREE_BLACK
+ * @brief       红黑树节点颜色常量: 黑色
+ * @details     红黑树中黑色节点的颜色标志。
+ *              根节点和叶子节点（NIL）必须是黑色。
+ *              从任一节点到其所有后代叶子节点的路径上黑色节点数相同（性质5）。
+ */
 #define REDBLACKTREE_BLACK   0
 
-/** 红黑树节点颜色常量: 红色 */
+/**
+ * @macro       REDBLACKTREE_RED
+ * @brief       红黑树节点颜色常量: 红色
+ * @details     红黑树中红色节点的颜色标志。
+ *              红色节点不能连续出现（性质4），即红色节点的父节点和子节点必须是黑色。
+ *              新插入的节点默认为红色（不会违反性质5，可能违反性质4）。
+ */
 #define REDBLACKTREE_RED     1
 
 /**
@@ -193,6 +205,11 @@ struct rb_root {
  * @details     用于在变量声明时进行静态初始化，使根节点指针为 NULL，计数为 0。
  * @return      初始化器 { NULL, 0 }
  * @note        通常使用 DEFINE_REDBLACKTREE_ROOT 宏代替直接使用此宏
+ */
+/**
+ * @details     使用 C99 复合字面量语法进行初始化。
+ *              rb_node = NULL 表示空树（无根节点）。
+ *              count = 0 表示节点数为零。
  */
 #define REDBLACKTREE_ROOT_INIT (struct rb_root){ NULL, 0 }
 
@@ -537,6 +554,14 @@ int RedBlackTree_traverse(const struct rb_root *root,
  *   }
  * @endcode
  */
+/**
+ * @details     实现原理:
+ *              1. 初始化: pos = RedBlackTree_first(root)（获取最小节点）
+ *              2. 条件: pos != NULL（还有节点）
+ *              3. 递进: pos = RedBlackTree_next(pos)（获取后继节点）
+ *
+ *              遍历顺序严格按中序（键值从小到大），因为红黑树是 BST。
+ */
 #define RedBlackTree_for_each(pos, root) \
     for (pos = RedBlackTree_first(root); pos; pos = RedBlackTree_next(pos))
 
@@ -567,6 +592,16 @@ int RedBlackTree_traverse(const struct rb_root *root,
  *   }
  * @endcode
  */
+/**
+ * @details     实现原理:
+ *              1. 初始化: pos = first, n = next(pos)（预存下一个节点）
+ *              2. 条件: pos != NULL
+ *              3. 递进: pos = n（使用预存的节点）, n = next(pos)（预存新的下一个）
+ *
+ *              安全性: 即使在循环体内删除 pos，n 已经保存了下一个节点的指针，
+ *              不会导致访问已释放内存或断链。
+ *              注意: 不要删除非 pos 的节点。
+ */
 #define RedBlackTree_for_each_safe(pos, n, root) \
     for (pos = RedBlackTree_first(root), n = pos ? RedBlackTree_next(pos) : NULL; \
          pos; pos = n, n = pos ? RedBlackTree_next(pos) : NULL)
@@ -579,6 +614,16 @@ int RedBlackTree_traverse(const struct rb_root *root,
  * @param       pos:    循环变量（宿主结构体指针）
  * @param       root:   红黑树根指针
  * @param       member: rb_node 在宿主结构体中的成员名
+ */
+/**
+ * @details     实现原理:
+ *              1. 初始化: 通过 RedBlackTree_entry_safe 将 first() 返回的 rb_node
+ *                 转换为宿主结构体指针 pos
+ *              2. 条件: pos != NULL（使用 RedBlackTree_entry_safe 处理 NULL 情况）
+ *              3. 递进: 从 pos->member 获取 next 节点，再转换为宿主结构体指针
+ *
+ *              使用 RedBlackTree_entry_safe 而非 RedBlackTree_entry 是为了
+ *              安全处理空树的情况（first 返回 NULL）。
  */
 #define RedBlackTree_for_each_entry(pos, root, member) \
     for (pos = RedBlackTree_entry_safe(RedBlackTree_first(root), typeof(*pos), member); \
@@ -602,6 +647,16 @@ int RedBlackTree_traverse(const struct rb_root *root,
  *   }
  * @endcode
  */
+/**
+ * @details     实现原理:
+ *              1. 初始化: pos = entry_safe(first), n = entry_safe(next(&pos->member))
+ *              2. 条件: pos != NULL
+ *              3. 递进: pos = n, n = entry_safe(next(&pos->member))
+ *
+ *              安全性: n 预存了下一个宿主结构体指针，允许在循环体内安全删除 pos。
+ *              使用 RedBlackTree_entry_safe 确保在边界条件下（如只有一个节点时）
+ *              不会对 NULL 指针调用 container_of。
+ */
 #define RedBlackTree_for_each_entry_safe(pos, n, root, member) \
     for (pos = RedBlackTree_entry_safe(RedBlackTree_first(root), typeof(*pos), member), \
          n = pos ? RedBlackTree_entry_safe(RedBlackTree_next(&pos->member), typeof(*pos), member) : NULL; \
@@ -616,6 +671,11 @@ int RedBlackTree_traverse(const struct rb_root *root,
  * @param       pos:  循环变量，当前节点 (struct rb_node *)
  * @param       n:    临时变量，预存前一个节点 (struct rb_node *)
  * @param       root: 红黑树根指针
+ */
+/**
+ * @details     与 RedBlackTree_for_each_safe 对称，方向相反。
+ *              从最大节点开始，使用 RedBlackTree_prev 向前遍历。
+ *              n 预存前一个节点，允许安全删除 pos。
  */
 #define RedBlackTree_for_each_reverse_safe(pos, n, root) \
     for (pos = RedBlackTree_last(root), n = pos ? RedBlackTree_prev(pos) : NULL; \

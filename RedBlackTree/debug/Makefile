@@ -1,52 +1,85 @@
-# 工具链
+# ==============================================================================
+# 工具链配置
+# ==============================================================================
+# 使用 ARM Linux 交叉编译工具链（针对 IMX6ULL 平台，ARM Cortex-A7）
 CC = arm-linux-gnueabihf-gcc
 AR = arm-linux-gnueabihf-ar
 
+# ==============================================================================
 # 项目配置
+# ==============================================================================
 TARGET_Name        = RedBlackTree
 ProgramVER         = 1.0.0
 USERNAME           = zlzksrl
+# 公共库安装路径（RedBlackTree 依赖 KernelLinkedList 的 container_of 宏）
 LIBFILE_PATH       = ~/zlzksrl/LinuxARM/PublicLibrary/LinuxARM_IMX6ULL
 
+# ==============================================================================
 # 安装路径
+# ==============================================================================
+# 本地安装路径（库文件和头文件安装到此目录）
 INSTALL_PATH    =  $(LIBFILE_PATH)/$(TARGET_Name)/
+# 远程部署目标（通过 scp 部署到目标开发板）
 INSTALLBOARD       = root@192.168.1.6:/usr/zlzksrl/app/$(TARGET_Name)/
 
-#库路径
+# ==============================================================================
+# 库路径
+# ==============================================================================
+# 公共库链接路径（当前未使用，预留扩展）
 PUBLIC_LIBPATH     				= -L $(LIBFILE_PATH)/lib/
+# 公共头文件路径（当前未使用，预留扩展）
 PUBLIC_LIBINCPATH  				= -I $(LIBFILE_PATH)/include/
+# KernelLinkedList 头文件路径（RedBlackTree 依赖 container_of / offsetof 宏）
 KernelLinkedList_LIBINCPATH		= -I $(LIBFILE_PATH)/KernelLinkedList/include
 
+# ==============================================================================
 # 编译选项
+# ==============================================================================
+# -g:      生成调试信息（GDB 调试用）
+# -Wall:   开启常见警告
+# -Wextra: 开启额外警告
 CFLAGS  = -g -Wall -Wextra
+# 追加公共头文件和 KernelLinkedList 头文件搜索路径
 CFLAGS  := $(CFLAGS) $(PUBLIC_LIBINCPATH) $(KernelLinkedList_LIBINCPATH)
 
+# 位置无关代码编译选项（动态库必需）
 PIC_FLAGS = -fPIC
 
-# 源文件（明确列出）
+# ==============================================================================
+# 源文件与目标文件
+# ==============================================================================
+# 库源文件（位于 ../src/ 目录）
 SOURCES     = RedBlackTree.c
+# 测试主程序源文件（位于当前目录）
 MAIN_SOURCE = main.c
 
-# 目标文件
+# 目标文件（分离静态库和动态库的 .o 文件，避免 -fPIC 混用）
 STATIC_OBJS = $(addprefix obj_static/,$(notdir $(SOURCES:.c=.o)))
 SHARED_OBJS = $(addprefix obj_shared/,$(notdir $(SOURCES:.c=.o)))
 MAIN_OBJ    = $(MAIN_SOURCE:.c=.o)
 
-# 库文件
+# ==============================================================================
+# 输出文件
+# ==============================================================================
+# 静态库和动态库文件名
 STATIC_LIBNAME = lib$(TARGET_Name).a
 SHARED_LIBNAME = lib$(TARGET_Name).so
 
-# 可执行文件
+# 可执行文件（带日期戳的版本和默认版本）
 TARGET_DATE    = $(TARGET_Name)_DebugPro$(shell date "+%Y%m%d").bin
 TARGET         = $(TARGET_Name)_DebugPro.bin
 
-#自动生成的头文件
+# 自动生成的头文件（包含编译时间戳信息）
 TARGET_MAKETIME_H  = ./../src/$(TARGET_Name)_Maketime.h
 
-#自动生成的工程信息
+# 自动生成的工程信息文件（包含库文件 MD5 校验）
 PROJECT_INFO     = ./ProjectInfo.txt
 
 
+# ==============================================================================
+# 自动生成编译时间戳头文件
+# 在每次 make 时自动生成，包含用户名、版本号和编译时间
+# 格式: #define RedBlackTree_PROJECT_MAKETIME "zlzksrl-1.0.0 at 2026.05.08-11.43.27"
 # ==============================================================================
 MAKETIME      = $(shell date "+%G.%m.%d-%H.%M.%S")
 MAKETIME_FILE := $(shell echo "\#ifndef __$(TARGET_Name)_PROJECT_MAKETIME_H__" >  $(TARGET_MAKETIME_H))
@@ -57,66 +90,73 @@ MAKETIME_FILE := $(shell echo " "                                              >
 MAKETIME_FILE := $(shell echo "\#endif"                                        >> $(TARGET_MAKETIME_H))
 
 # ==============================================================================
-# 伪目标
+# 伪目标声明（这些目标不对应实际文件）
+# ==============================================================================
 .PHONY: all clean install install_lib slib dlib app
 
+# ---- 默认目标: 构建静态库、动态库、可执行程序 ----
 all: slib dlib app
+	# 生成工程信息文件（包含库文件 MD5 校验和）
 	echo "PROJECT_MAKETIME $(USERNAME)-$(ProgramVER) at $(MAKETIME) $(STATIC_LIBNAME)" >  $(PROJECT_INFO)
 	md5sum $(STATIC_LIBNAME) >> $(PROJECT_INFO)
 	echo "PROJECT_MAKETIME $(USERNAME)-$(ProgramVER) at $(MAKETIME) $(SHARED_LIBNAME)" >> $(PROJECT_INFO)
 	md5sum $(SHARED_LIBNAME) >> $(PROJECT_INFO)
 	cat $(PROJECT_INFO)
-	rm -f *.o  -rf
+	# 清理中间目标文件
+	rm -f *.o -rf
 	rm -f obj_shared/*.o obj_shared/ -rf
 	rm -f obj_static/*.o obj_static/ -rf
 # ==============================================================================
-	
-# 静态库
+
+# ---- 静态库构建 ----
+# ar -crs: c=创建, r=替换, s=建立索引
 slib: $(STATIC_LIBNAME)
 
 $(STATIC_LIBNAME): $(STATIC_OBJS)
 	$(AR) -crs $@ $^
 
-# 普通 .o 文件（用于静态库，不加 -fPIC）
+# 静态库 .o 文件（不加 -fPIC，避免性能损失）
 obj_static/%.o: ../src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) -o  $@  $< -c $(CFLAGS) 
+	$(CC) -o  $@  $< -c $(CFLAGS)
+
 # ==============================================================================
-# 动态库
+# ---- 动态库构建 ----
+# -shared: 生成共享库, -fPIC: 位置无关代码
 dlib: $(SHARED_LIBNAME)
 
 $(SHARED_LIBNAME): $(SHARED_OBJS)
 	$(CC) -shared $(PIC_FLAGS) $(CFLAGS) -o $@ $^
-	
-# 带 fPIC 的 .o 文件，放入 obj_shared/
+
+# 动态库 .o 文件（必须加 -fPIC），放入 obj_shared/ 目录
 obj_shared/%.o: ../src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(PIC_FLAGS) $(CFLAGS) -c $< -o $@
 
 # ==============================================================================
-# 可执行程序（链接静态库）
+# ---- 可执行程序构建（链接静态库） ----
 app: $(STATIC_LIBNAME) $(MAIN_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET) $(MAIN_OBJ) $(STATIC_LIBNAME)
 	@chmod 755 $(TARGET)
 
-# main.o 单独编译
+# main.o 单独编译（测试主程序）
 $(MAIN_OBJ): $(MAIN_SOURCE)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ==============================================================================
-# 清理
+# ---- 清理目标 ----
 clean:
-	rm -f *.o  -rf
+	rm -f *.o -rf
 	rm -f obj_shared/*.o obj_shared/ -rf
 	rm -f obj_static/*.o obj_static/ -rf
 	rm -f $(STATIC_LIBNAME) $(SHARED_LIBNAME)
 	rm -f $(TARGET)
-	
-# 安装可执行文件
+
+# ---- 安装可执行文件到目标开发板（通过 scp） ----
 install:
 	scp $(TARGET) $(INSTALLBOARD);
 
-# 安装库文件
+# ---- 安装库文件到本地公共库目录 ----
 install_lib:slib dlib
 	rm $(INSTALL_PATH) -rf
 	mkdir -p $(INSTALL_PATH)
