@@ -329,6 +329,15 @@ fclose(fp);
 
 > **变长二进制**需应用层自己界定边界（如长度前缀：先 Put 4 字节长度、再 Put 数据，消费端先读长度再读数据）。库只管搬运字节，不拆包。
 
+> **含 `0x00`/NULL 字节也安全**：库数据路径全部按字节长度处理（`memcpy`/地址），**不对数据调用 `strlen`/`strcpy` 等字符串函数**，所以二进制中的 `0x00` 与普通字节无异，不会截断或丢失（`put == consumed`，一字节不差）。⚠️ **消费端务必按 `GetData`/回调返回的 `len` 处理**，勿用 `strlen`/`strcpy`/`printf("%s")`——它们遇 `0x00` 会截断/出错：
+> ```c
+> /* ✅ 正确：按 len 处理 */
+> int n = StreamBufferAPI_GetData(sb, buf, sizeof(buf));
+> fwrite(buf, 1, n, fp);          /* fwrite 按长度，0x00 正常 */
+> /* ❌ 错误：字符串函数遇 0x00 截断 */
+> strlen(buf);  strcpy(dst, buf);  printf("%s", buf);
+> ```
+
 ---
 
 ## 七、优雅关闭与 Reopen
