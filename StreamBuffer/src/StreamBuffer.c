@@ -24,6 +24,7 @@
 #include "StreamBuffer_Maketime.h"
 
 #include <errno.h>   /* ETIMEDOUT */
+#include <time.h>    /* clock_gettime / CLOCK_MONOTONIC */
 
 
 /* ========================== 内部辅助函数 ========================== */
@@ -83,12 +84,13 @@ static int sb_clamp_ret(int c, int len, const char *name)
  */
 static void sb_calc_deadline(struct timespec *ts, int timeo_ms)
 {
-    struct timeval now;
-    long total_us;
-    gettimeofday(&now, NULL);
-    total_us = now.tv_usec + (timeo_ms % 1000) * 1000;
-    ts->tv_sec  = now.tv_sec + timeo_ms / 1000 + total_us / 1000000;
-    ts->tv_nsec = (total_us % 1000000) * 1000;
+    long add_ns;
+    long nsec;
+    clock_gettime(CLOCK_MONOTONIC, ts);     /* 单调时钟，不受 NTP/手动改时影响 */
+    add_ns = (long)(timeo_ms % 1000) * 1000000L;
+    nsec   = ts->tv_nsec + add_ns;
+    ts->tv_sec  += timeo_ms / 1000 + nsec / 1000000000L;
+    ts->tv_nsec  = nsec % 1000000000L;
 }
 
 
@@ -164,7 +166,14 @@ int StreamBufferAPI_Init(T_StreamBuffer **pp, const T_StreamBufferConfig *cfg, c
     pt->mask        = capacity - 1;
     pt->flush_bytes = flush_bytes;
     pthread_mutex_init(&pt->mux, NULL);
-    pthread_cond_init(&pt->cond, NULL);
+    {
+        /* cond 使用 CLOCK_MONOTONIC，超时不受系统时间跳变影响 */
+        pthread_condattr_t attr;
+        pthread_condattr_init(&attr);
+        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        pthread_cond_init(&pt->cond, &attr);
+        pthread_condattr_destroy(&attr);
+    }
     pt->init_done   = 1;
     /* read/write/used/is_closed/统计/consume_cb 均被 memset 清零 */
 
@@ -194,7 +203,6 @@ int StreamBufferAPI_Destroy(T_StreamBuffer **pp)
     free(pt->buffer);
     pthread_mutex_destroy(&pt->mux);
     pthread_cond_destroy(&pt->cond);
-    pt->init_done = 0;
     free(pt);
     *pp = NULL;
     return 0;
@@ -304,18 +312,21 @@ int StreamBufferAPI_PutData(T_StreamBuffer *p, const char *buf, int len)
     }
 
     /* 超容量截断 */
-    if(len > p->capacity)
     {
-        len = p->capacity;
-    }
+        int orig_len = len;
+        if(len > p->capacity)
+        {
+            len = p->capacity;
+        }
 
-    /* 满则丢新 */
-    free_space = p->capacity - p->used;
-    if(free_space < len)
-    {
-        p->dropped += (unsigned long)len;
-        pthread_mutex_unlock(&p->mux);
-        return -3;
+        /* 满则丢新：dropped 记原始长度（用户实际想写的量，非截断后） */
+        free_space = p->capacity - p->used;
+        if(free_space < len)
+        {
+            p->dropped += (unsigned long)orig_len;
+            pthread_mutex_unlock(&p->mux);
+            return -3;
+        }
     }
 
     /* 写入：跨回绕分两段 memcpy */
@@ -367,18 +378,21 @@ int StreamBufferAPI_Wait(T_StreamBuffer *p, int timeo, int *used_out)
     {
         return STREAMBUFFER_STATUS_NOINIT;      /* -4 */
     }
+    if(timeo < 0)
+    {
+        return STREAMBUFFER_STATUS_INVALID;     /* -3 */
+    }
 
     pthread_mutex_lock(&p->mux);
 
     /* ---- 阻塞等待（timeo>0）：used≥阈值 或 关闭 或 超时 ---- */
     if(timeo > 0)
     {
+        struct timespec ts;
+        sb_calc_deadline(&ts, timeo);     /* 循环外算一次绝对 deadline，循环内复用（避免反复刷新致永不超时） */
         while(p->used < p->flush_bytes && !p->is_closed)
         {
-            struct timespec ts;
-            int r;
-            sb_calc_deadline(&ts, timeo);
-            r = pthread_cond_timedwait(&p->cond, &p->mux, &ts);
+            int r = pthread_cond_timedwait(&p->cond, &p->mux, &ts);
             if(r == ETIMEDOUT)
             {
                 timed_out = 1;

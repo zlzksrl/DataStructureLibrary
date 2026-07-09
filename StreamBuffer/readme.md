@@ -19,6 +19,7 @@
 - [八、构建系统](#八构建系统)
 - [九、设计决策](#九设计决策)
 - [十、验证](#十验证)
+- [十一、变更记录](#十一变更记录)
 - [许可证](#许可证)
 
 ---
@@ -361,6 +362,24 @@ make install_lib # 安装库到本地公共路径
 - `demo2_output.csv` 末行 `cb=99` → 100 条全部落盘
 
 端到端（PutData → 缓冲 → 出队 → fwrite）数据完整，无丢条无截断。
+
+---
+
+## 十一、变更记录
+
+### 2026-07-09：按 AI 代码审查修复（见 `AI审查.md`）
+
+| 级别 | 修改 | 说明 |
+|------|------|------|
+| 🔴 P0 必修 | `Wait` 超时 deadline 移到 while 循环外（循环内复用） | 修复"deadline 反复刷新→周期 Flush + 零散数据下消费者永不超时"的条件变量经典反模式 |
+| 🟠 P1 | `PutData` 的 `dropped` 统计改记**原始 len**（非截断后） | 避免 Put 大段（len>capacity）时统计失真 |
+| 🟠 P1 | `Wait` 入口校验 `timeo<0` → 返回 `INVALID` | 负超时不再被静默当作立即返回 |
+| 🟡 P2 | cond 改用 `CLOCK_MONOTONIC`（`pthread_condattr_setclock` + `clock_gettime`） | 超时不受 NTP/手动改时跳变影响 |
+| ⚪ P3 | 删除 `Destroy` 中冗余的 `init_done=0` | free 前置零无意义 |
+
+**未采纳（保持现状）**：回调消费空后 status 降级为 `TIMEOUT_EMPTY`（已确认的重算规则，文档已说明）、`printf` 日志与 `init_done` 锁外读（与 ThreadQueue/WindowQueue 库保持一致）。
+
+**验证**：x86 gcc 编译 0 错误 0 警告，运行 `put==consumed`（无丢失）、三种消费/Reopen/Init 校验全部正常，无回归；`CLOCK_MONOTONIC` 在 x86 也通过。建议 arm 板重新 `make` 验证。
 
 ---
 
