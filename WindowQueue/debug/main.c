@@ -219,14 +219,15 @@ static double mean_filter_snapshot(T_WindowQueueMsg *q, Sensor *p_buf, int *p_n)
         if(p_n) *p_n = 0;
         return NAN;
     }
-    double sum = 0.0;
+    /* 提取 value 字段到 double 数组，调用通用均值算法 */
+    double vals[WIN_CAPACITY];
     int i;
     for(i = 0; i < n; i++)
     {
-        sum += p_buf[i].value;
+        vals[i] = p_buf[i].value;
     }
     if(p_n) *p_n = n;
-    return sum / n;
+    return mean_double(vals, n);
 }
 
 
@@ -354,6 +355,8 @@ static void *proc_thread(void *arg)
  */
 int main(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
     int ret;
     T_WindowQueueMsg *q = NULL;
     pthread_t tid_acq, tid_proc;
