@@ -261,7 +261,7 @@ int StreamBufferAPI_IsClosed(T_StreamBuffer *p);
  *                 （write 到尾 + 头到剩余），保证变长紧凑、零浪费；
  *               - 写入成功后若 used ≥ 阈值，**signal 唤醒一个**阻塞在 Wait 的消费者；
  *               - 空间不足（剩余 = capacity-used < len）：**丢弃本段**（不入队），
- *                 统计 ulDropped+=len，返回 -3，不阻塞；
+ *                 统计 ulDropped+=原始len（用户传入的实际长度，非截断后），返回 -3，不阻塞；
  *               - len 超过缓冲容量时按容量截断；
  *               - Close 后调用：返回 -2。
  *               日志场景：调用者先用 snprintf/vsnprintf 格式化好（含 \r\n）再传入。
@@ -309,6 +309,7 @@ int StreamBufferAPI_PutData(T_StreamBuffer *p, const char *buf, int len);
  *
  *               timeo=0：不等待，立即按当前状态计算并返回（used>0→TRIGGER；used==0且未关闭→
  *               TIMEOUT_EMPTY；已关闭按数据情况→CLOSE_DATA/CLOSE_EMPTY）。
+ *               timeo<0：参数无效，返回 INVALID(-3)。
  *
  *               若注册了零拷贝回调（SetConsumeCallback）且本次返回 >0，则 Wait 在返回前
  *               先阻塞调用回调消费（回绕分两次，每段 len 为该连续段长度，data+len 不越界；

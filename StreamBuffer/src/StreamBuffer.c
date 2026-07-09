@@ -80,7 +80,7 @@ static int sb_clamp_ret(int c, int len, const char *name)
 
 /**
  * @func         sb_calc_deadline
- * @brief        计算条件变量绝对超时（当前时间 + timeo_ms 毫秒，CLOCK_REALTIME）
+ * @brief        计算条件变量绝对超时（CLOCK_MONOTONIC 当前时间 + timeo_ms 毫秒）
  */
 static void sb_calc_deadline(struct timespec *ts, int timeo_ms)
 {
