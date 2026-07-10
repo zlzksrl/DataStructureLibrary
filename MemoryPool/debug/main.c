@@ -18,6 +18,7 @@
 #include <pthread.h>
 
 #include "../include/MemoryPool.h"
+#include <ThreadQueue.h>
 
 
 /* ========================== 调试宏 ========================== */
@@ -183,6 +184,91 @@ static void test_block(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*     Part 4: 配合 ThreadQueue（Alloc→PutMsg→GetMsg→Free 循环复用）  */
+/*                                                                    */
+/* ================================================================== */
+
+typedef struct { int id; int val; } T_QMsg;
+
+static T_MemPool        *g_qpool;
+static T_ThreadQueueMsg *g_q;
+
+/* 队列残留数据释放回调：归还到池 */
+static void q_release(void *data)
+{
+    MemPoolAPI_Free(g_qpool, data);
+}
+
+/* 生产者：Alloc(池取) → 填数据 → PutMsg(入队) */
+static void *q_producer(void *arg)
+{
+    int N = *(int *)arg;
+    int i;
+    for(i = 0; i < N; i++)
+    {
+        T_QMsg *m = (T_QMsg *)MemPoolAPI_AllocBlock(g_qpool, 0);   /* 池满则阻塞等 */
+        m->id  = i;
+        m->val = i * 10;
+        ThreadQueueAPI_PutMsg(g_q, m);
+    }
+    return NULL;
+}
+
+/* 消费者：GetMsg(取) → 用数据 → Free(归还池) */
+static void *q_consumer(void *arg)
+{
+    int N = *(int *)arg;
+    int i;
+    for(i = 0; i < N; i++)
+    {
+        T_QMsg *m = (T_QMsg *)ThreadQueueAPI_GetMsg(g_q, 1000);
+        if(m != NULL)
+        {
+            MemPoolAPI_Free(g_qpool, m);   /* 归还池，循环复用 */
+        }
+    }
+    return NULL;
+}
+
+static void test_with_threadqueue(void)
+{
+    T_MemPoolConfig pcfg = { (int)sizeof(T_QMsg), 8, MEMPOOL_MODE_BLOCK, 0, 0 };
+    int N = 1000;        /* 每轮入队/出队条数 */
+    int ROUNDS = 10;     /* 频繁测试轮数（共 N×ROUNDS 次流转） */
+    int r;
+    pthread_t tp, tc;
+    T_MemPoolStats st;
+
+    MemPoolAPI_Init(&g_qpool, &pcfg, "qpool");
+    ThreadQueueAPI_InitMsg(&g_q, 100, "q", q_release);   /* 队列残留→归还池 */
+
+    /* 多轮频繁测试：每轮 N 条入队/出队，验证池循环复用长期稳定 */
+    for(r = 0; r < ROUNDS; r++)
+    {
+        pthread_create(&tp, NULL, q_producer, &N);
+        pthread_create(&tc, NULL, q_consumer, &N);
+        pthread_join(tp, NULL);
+        pthread_join(tc, NULL);
+        MemPoolAPI_StatsGet(g_qpool, &st);
+        Debug_printx("POOL+QUEUE round %d/%d: alloc=%lu free=%lu capacity=%d",
+                     r + 1, ROUNDS, st.ulTotalAlloc, st.ulTotalFree, st.iCapacity);
+    }
+
+    /* 最终校验：累计 alloc==free==N*ROUNDS，capacity 恒定 8（无泄漏、无扩容） */
+    MemPoolAPI_StatsGet(g_qpool, &st);
+    Debug_printx("POOL+QUEUE total: alloc=%lu free=%lu capacity=%d (expect alloc=free=%d capacity=8)",
+                 st.ulTotalAlloc, st.ulTotalFree, st.iCapacity, N * ROUNDS);
+
+    /* 优雅关闭队列：Close → Flush(残留归还池) → Destroy（避免 Destroy 警告） */
+    ThreadQueueAPI_CloseMsg(g_q);
+    ThreadQueueAPI_FlushMsg(g_q, q_release);
+    ThreadQueueAPI_DestroyMsg(&g_q);
+    MemPoolAPI_Destroy(&g_qpool);
+}
+
+
+/* ================================================================== */
+/*                                                                    */
 /*     main                                                          */
 /*                                                                    */
 /* ================================================================== */
@@ -200,6 +286,9 @@ int main(int argc, char **argv)
 
     Debug_printx("========== Part 3: BLOCK Start ==========");
     test_block();
+
+    Debug_printx("========== Part 4: with ThreadQueue Start ==========");
+    test_with_threadqueue();
 
     Debug_printx("Program exit");
     return 0;

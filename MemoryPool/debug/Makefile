@@ -19,17 +19,24 @@ LIBFILE_PATH       = ~/zlzksrl/LinuxARM/PublicLibrary/LinuxARM_IMX6ULL
 INSTALL_PATH    =  $(LIBFILE_PATH)/$(TARGET_Name)/
 INSTALLBOARD       = root@192.168.1.6:/usr/zlzksrl/app/$(TARGET_Name)/
 
+# ThreadQueue 头文件路径
+ThreadQueue_LIBPATH		    = -L $(LIBFILE_PATH)/ThreadQueue/StaticLib
+ThreadQueue_LIBINCPATH		= -I $(LIBFILE_PATH)/ThreadQueue/include
+
 # ==============================================================================
 # 编译选项
 # ==============================================================================
 # -g: 调试信息; -Wall: 常见警告; -Wextra: 额外警告
 CFLAGS  = -g -Wall -Wextra
+CFLAGS  := $(CFLAGS) $(ThreadQueue_LIBINCPATH)
 
 # 位置无关代码（动态库必需）
 PIC_FLAGS = -fPIC
 
 # 链接选项：MemoryPool 使用 pthread_mutex/cond，需要 -pthread
 LDFLAGS = -pthread
+LDFLAGS := $(LDFLAGS) $(ThreadQueue_LIBPATH) 
+LDFLAGS := $(LDFLAGS)  -lThreadQueue
 
 # ==============================================================================
 # 源文件与目标文件
@@ -132,8 +139,9 @@ install_lib:slib dlib
 	rm $(INSTALL_PATH) -rf
 	mkdir -p $(INSTALL_PATH)
 	mkdir -p $(INSTALL_PATH)include/
-	mkdir -p $(INSTALL_PATH)lib/
-	cp $(STATIC_LIBNAME) $(INSTALL_PATH)lib/
-	cp $(SHARED_LIBNAME) $(INSTALL_PATH)lib/
+	mkdir -p $(INSTALL_PATH)StaticLib/
+	mkdir -p $(INSTALL_PATH)SharedLib/
+	cp $(STATIC_LIBNAME) $(INSTALL_PATH)StaticLib/
+	cp $(SHARED_LIBNAME) $(INSTALL_PATH)SharedLib/
 	cp ../include/* $(INSTALL_PATH)include/
 	cp $(PROJECT_INFO) $(INSTALL_PATH)
