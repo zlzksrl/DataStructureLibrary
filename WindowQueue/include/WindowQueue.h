@@ -275,7 +275,9 @@ int WindowQueueAPI_ForEach(T_WindowQueueMsg *pt_QueueMsg,
  * @details      重新分配 new_size×element_size 内存，按 FIFO 顺序搬移现有数据：
  *               - 变大：保留全部现有数据，容量扩展；
  *               - 变小：从最老端丢弃 (nData-new_size) 条多余数据，其余保留。
- *               全程在互斥锁内完成，原子替换内部 buffer 指针并重置读写偏移。
+ *               全程在互斥锁内完成（**O(n) 阻塞操作，勿在高频采集期频繁调用**），
+ *               原子替换内部 buffer 指针并重置读写偏移。
+ *               注意：缩容丢弃的数据**不计入** ulTotalDiscarded（非丢包）。
  * @param[in]    pt_QueueMsg: 队列句柄
  * @param[in]    new_size:    新的容量（元素个数），必须 > 0
  * @return       int ret

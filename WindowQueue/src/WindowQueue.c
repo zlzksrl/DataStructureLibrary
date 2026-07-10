@@ -94,6 +94,15 @@ int WindowQueueAPI_Init(T_WindowQueueMsg **ppt_QueueMsg,
     }
     memset(pt, 0, sizeof(T_WindowQueueMsg));
 
+    /* ---- 32位平台乘法溢出守卫 ---- */
+    if((size_t)iElementSize > SIZE_MAX / (size_t)iQueueLen ||
+       sizeof(const void *) > SIZE_MAX / (size_t)iQueueLen)
+    {
+        printf("size overflow (queueLen*elementSize) fail ##%s->%d\n", __FUNCTION__, __LINE__);
+        free(pt);
+        return -1;
+    }
+
     /* ---- 预分配环形缓冲区（值拷贝连续内存）---- */
     pt->buffer = (unsigned char *)malloc((size_t)iQueueLen * (size_t)iElementSize);
     if(NULL == pt->buffer)
@@ -389,6 +398,13 @@ int WindowQueueAPI_Resize(T_WindowQueueMsg *pt_QueueMsg, int new_size)
     int es = pt_QueueMsg->element_size;
 
     /* 先分配新 buffer 与新 view，成功后才替换（原子） */
+    if((size_t)es > SIZE_MAX / (size_t)new_size ||
+       sizeof(const void *) > SIZE_MAX / (size_t)new_size)
+    {
+        printf("size overflow in Resize ##%s->%d\n", __FUNCTION__, __LINE__);
+        pthread_mutex_unlock(&pt_QueueMsg->mux);
+        return -1;
+    }
     unsigned char *newbuf = (unsigned char *)malloc((size_t)new_size * (size_t)es);
     const void   **newview = (const void **)malloc((size_t)new_size * sizeof(const void *));
     if(NULL == newbuf || NULL == newview)
