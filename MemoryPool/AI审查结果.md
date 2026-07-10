@@ -266,3 +266,107 @@ return (size + MEMPOOL_ALIGN - 1) / MEMPOOL_ALIGN * MEMPOOL_ALIGN;
 ## 五、结论
 
 该内存池模块**设计正确、实现规范、文档完善**，核心并发与生命周期逻辑无致命缺陷，可投入生产使用。建议优先修复 **问题 2（溢出校验）** 和 **问题 1（BLOCK 超时重判）** 这两个中等健壮性问题——前者关乎 32 位平台下的堆安全，后者关乎 BLOCK 模式返回值的严格正确性；其余多为防御性增强与一致性优化，可排期逐步完善。整体代码质量在同系列库中处于**良好水平**。
+
+---
+
+# 第二轮审查（修复后复核）
+
+> **复核范围**：第一轮所提问题的修复正确性 + 是否引入新问题 + 遗漏项深挖
+> **复核日期**：2026-07-10（第二轮）
+> **改动文件**：`src/MemoryPool.c`、`include/MemoryPool.h`、`debug/Makefile`（库已重新编译，`.a/.so/.bin` 均已更新）
+> **`main.c`**：**未改动**——第一轮建议的边界测试用例（超时竞态/超大 count/非法 mode 等）未补入。
+
+## 一、第一轮问题修复复核
+
+| # | 第一轮问题 | 修复方式 | 结论 |
+|---|-----------|---------|------|
+| 1 | BLOCK 超时 stolen wakeup | `MemoryPool.c:393-403`：`ETIMEDOUT` 后持锁重判 `free_list`，仍空才返回 NULL，否则 `break` 走正常分配 | ✅ **正确** |
+| 2 | 乘法溢出致堆溢出 | 新增 `mp_size_overflow()`（`MemoryPool.c:43-47`），Init（177）、GROW（328）两处校验，均在 `malloc` 之前 | ✅ **正确** |
+| 3 | GROW malloc 失败不计统计 | 两处失败分支补 `total_drop++`（337、345） | ✅ **正确** |
+| 4 | `ulTotalDrop` 语义模糊 | 头文件注释更新为复合语义说明 | ✅ **已说明** |
+| 6 | `mode` 越界 / 负 `block_timeo` | mode 范围校验返 -1（158-162）；负 `block_timeo` 夹紧到 0（164-167） | ✅ **已修**（夹紧语义见下文讨论） |
+| 8 | CFLAGS 缺 `-pthread` | `Makefile:30` 补 `-pthread` | ✅ **正确** |
+| 11 | 对齐注释写 "max_align_t" | 改为 "按平台最大常用类型" | ✅ **正确** |
+
+**两个中等问题（1、2）修复均正确且完整，未引入资源泄漏或新缺陷。** 关键确认：
+
+- **问题 1**：`break` 后落入 `slot = p->free_list; ...`（406 行），此时 `free_list` 已确认非空，`*(void**)slot` 解引用安全；且超时分支不再 `total_drop++`（改为计入 `total_alloc`），语义正确。
+- **问题 2**：`mp_size_overflow` 用 `(size_t)count > (size_t)-1 / (size_t)align_size`，是标准溢出判据；Init 中置于 `malloc(pt/ch)` **之前**（177 vs 187），失败即返、无泄漏；GROW 中置于 `grow_count<=0` 之后、`malloc` 之前（328 vs 334），路径安全。
+
+## 二、修复引入的细节讨论（非缺陷，供决策）
+
+### 讨论 A：`block_timeo` 负值"夹紧到 0"= 无限阻塞，是把"快速失败"变成了"静默挂起"
+
+`MemoryPool.c:164-167` 将负 `block_timeo` 夹紧为 0。问题在于：`block_timeo == 0` 在 BLOCK 模式里代表**无限等待**。于是：
+
+- **修复前**（旧行为）：负值 → `mp_alloc_block` 的 `timeo < 0` 分支立即返回 NULL —— 调用方马上看到"分配失败"，**故障显式、易发现**。
+- **修复后**（夹紧到 0）：负值 → 默认 `Alloc()` 进入 `while(free_list==NULL) cond_wait` **永久阻塞** —— 调用方线程挂死，**故障隐蔽、难定位**。
+
+对"误配置"场景而言，"静默无限挂起"比"立即返回 NULL"是**更危险的失败模式**。第一轮我建议的是"告警/夹紧到 0"，夹紧是合理选择之一，但"夹紧到无限等待"这一层含义值得重新斟酌。
+
+**建议（二选一，优先前者）**：
+1. 负 `block_timeo` 直接 `Init` 返回 -1（拒绝），把误配置挡在初始化阶段；或
+2. 保留夹紧，但在头文件 `block_timeo` 字段注释里**显式写明**："负值将被夹紧为 0（即无限等待）"，避免使用者误以为"负值=禁用超时"。
+
+> 说明：当前 `MemPoolAPI_AllocBlock(p, timeo)` **显式接口**仍保留 `timeo < 0 → return NULL`（372 行），与默认 `Alloc()` 走 `block_timeo` 的夹紧行为**不一致**。同一池里，显式传负值立即失败、默认 Alloc 却无限等，容易让使用者困惑。统一为"拒绝"或统一为"夹紧"都行，现状是两边各一套。
+
+## 三、第二轮新发现（深挖）
+
+### 🟡 新发现 1：`pthread_cond_timedwait` 返回非 ETIMEDOUT 错误时会**忙等空转**
+
+`MemoryPool.c:390-404`：
+
+```c
+while(p->free_list == NULL)
+{
+    int r = pthread_cond_timedwait(&p->cond, &p->mux, &ts);
+    if(r == ETIMEDOUT) { ... }
+    /* ← 未处理 r 为 EINVAL 等其它非 0 错误 */
+}
+```
+
+**描述**：循环只识别 `ETIMEDOUT`。若 `timedwait` 返回其它非 0 值（`EINVAL` 等），代码既不退出也不处理，直接回到 `while` 顶端——`free_list` 仍为空、再次调用 `timedwait`、又立即返回 `EINVAL`……形成 **CPU 忙等空转（busy spin）**。
+
+**触发路径**（与第一轮问题 9 联动）：`mp_calc_deadline` 未检查 `clock_gettime` 返回值（`MemoryPool.c:93`）。若 `clock_gettime` 失败，`ts` 内容未定义，`tv_nsec` 可能 ≥ 1e9 → `pthread_cond_timedwait` 返回 `EINVAL` → 进入上述空转。即：**问题 9 不只是"超时不准"，还可能触发这里的 CPU 空转**。
+
+**现实概率**：低。`clock_gettime(CLOCK_MONOTONIC)` 在 Linux 上几乎不会失败，正常 `cond/mux` 也不会返回 `EINVAL`。属**防御性健壮性**问题，非线上必现 bug。
+
+**建议**：
+
+```c
+int r = pthread_cond_timedwait(&p->cond, &p->mux, &ts);
+if(r == ETIMEDOUT)
+{
+    if(p->free_list == NULL) { p->total_drop++; unlock; return NULL; }
+    break;
+}
+else if(r != 0 && r != EINTR)   /* 非 ETIMEDOUT 的意外错误：避免忙等 */
+{
+    p->total_drop++;
+    pthread_mutex_unlock(&p->mux);
+    return NULL;   /* 或记一条错误日志后返回 NULL */
+}
+```
+
+> 配合**第一轮问题 9**：`clock_gettime`/`pthread_condattr_setclock` 的返回值也应检查，从源头避免产出非法 `ts`。
+
+## 四、仍待处理项（第一轮未改，状态不变）
+
+| # | 项 | 现状 | 优先级 |
+|---|----|------|--------|
+| 5 | `Destroy` 未 `cond_broadcast` 唤醒 BLOCK 等待者（生命周期隐患） | 未改 | 中（已有 `@warning` 文档兜底） |
+| 7 | 库内直接 `printf`（无日志抽象、版本号每次刷屏） | 未改 | 低 |
+| 9 | `clock_gettime` / `setclock` 返回值未检查 | 未改（**与新发现 1 联动**） | 低→中 |
+| 10 | `mp_align_up` 对接近 `INT_MAX` 的 size 有符号溢出 | 未改 | 低 |
+| 12-14 | 文档/风格 nit（"幂等"措辞、`strncpy` 冗余、测试用全局句柄） | 未改 | 可选 |
+| 测试 | `main.c` 未补边界用例（超时竞态/超大 count/非法 mode/double-free/Destroy 残留/跨池 Free） | **未改** | 中 |
+
+其中**测试覆盖**值得在下一轮补上：当前 `main.c` 验证了三模式基本功能与队列压测，但**没有一条用例真正压到本次修复的代码路径**——问题 1 的"超时与 Free 并发"、问题 2 的"超大 init_count"、问题 6 的"非法 mode/负超时"都没有对应的回归测试。这意味着这些修复**当前没有自动化保护**，后续改动有回归风险而无告警。
+
+## 五、第二轮结论
+
+第一轮提出的 **2 个中等问题均已正确修复，无回归、无泄漏、无新缺陷**，修复质量高。`-pthread`、对齐注释、`ulTotalDrop` 语义等一并修正。
+
+第二轮新增 1 个低-中优先级的**防御性发现**（`timedwait` 非 ETIMEDOUT 错误的忙等空转，与未检查的 `clock_gettime` 联动），建议顺手处理；另对 `block_timeo` 夹紧语义提出一个**设计层面的再斟酌**（夹紧到"无限等待" vs 拒绝初始化）。
+
+**当前状态：可投入生产。** 剩余项均为防御性/一致性增强与测试补强，建议下一轮：① 补 `main.c` 回归用例（覆盖本次修复路径）；② 处理新发现 1 + 问题 9；③ 视场景决定 `block_timeo` 负值的最终策略。

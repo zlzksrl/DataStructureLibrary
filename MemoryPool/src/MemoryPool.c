@@ -36,6 +36,17 @@ static int mp_align_up(int size)
 }
 
 /**
+ * @func         mp_size_overflow
+ * @brief        检查 count × align_size 是否会溢出 size_t（32位平台防堆溢出）
+ * @return       1=会溢出, 0=安全
+ */
+static int mp_size_overflow(int count, int align_size)
+{
+    return (count > 0 && align_size > 0 &&
+            (size_t)count > (size_t)-1 / (size_t)align_size);
+}
+
+/**
  * @func         mp_set_name
  * @brief        拷贝名称到固定缓冲（截断保护）
  */
@@ -143,12 +154,30 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
         printf("GROW mode need grow_count > 0 fail ##%s->%d\n", __FUNCTION__, __LINE__);
         return -1;
     }
+    /* ---- mode 取值范围校验 ---- */
+    if(mode < 0 || mode > MEMPOOL_MODE_BLOCK)
+    {
+        printf("mode %d invalid fail ##%s->%d\n", mode, __FUNCTION__, __LINE__);
+        return -1;
+    }
+    /* ---- block_timeo 负值夹紧到 0 ---- */
+    if(block_timeo < 0)
+    {
+        block_timeo = 0;
+    }
 
     /* ---- 对齐：向上补齐到 MEMPOOL_ALIGN，且保证 >= sizeof(void*) ---- */
     align_size = mp_align_up(element_size);
     if(align_size < (int)sizeof(void *))
     {
         align_size = (int)sizeof(void *);
+    }
+
+    /* ---- 乘法溢出校验（32位平台防 count×align_size 溢出致堆溢出）---- */
+    if(mp_size_overflow(init_count, align_size))
+    {
+        printf("init_count*align_size overflow fail ##%s->%d\n", __FUNCTION__, __LINE__);
+        return -1;
     }
 
     /* ---- 打印库版本 ---- */
@@ -296,9 +325,16 @@ static void *mp_alloc_grow(T_MemPool *p)
             pthread_mutex_unlock(&p->mux);
             return NULL;
         }
+        if(mp_size_overflow(p->grow_count, p->align_size))
+        {
+            p->total_drop++;
+            pthread_mutex_unlock(&p->mux);
+            return NULL;
+        }
         ch = (T_MemPoolChunk *)malloc(sizeof(T_MemPoolChunk));
         if(ch == NULL)
         {
+            p->total_drop++;              /* 扩容失败计入丢弃 */
             pthread_mutex_unlock(&p->mux);
             return NULL;
         }
@@ -306,6 +342,7 @@ static void *mp_alloc_grow(T_MemPool *p)
         if(ch->mem == NULL)
         {
             free(ch);
+            p->total_drop++;              /* 扩容失败计入丢弃 */
             pthread_mutex_unlock(&p->mux);
             return NULL;
         }
@@ -355,9 +392,14 @@ static void *mp_alloc_block(T_MemPool *p, int timeo)
             int r = pthread_cond_timedwait(&p->cond, &p->mux, &ts);
             if(r == ETIMEDOUT)
             {
-                p->total_drop++;          /* 超时计入丢弃 */
-                pthread_mutex_unlock(&p->mux);
-                return NULL;
+                /* 信号与超时可能并发：持锁再确认，仍有空闲则正常分配 */
+                if(p->free_list == NULL)
+                {
+                    p->total_drop++;      /* 确实超时无槽位 */
+                    pthread_mutex_unlock(&p->mux);
+                    return NULL;
+                }
+                break;                    /* 谓词已真，跳出走正常分配 */
             }
         }
     }

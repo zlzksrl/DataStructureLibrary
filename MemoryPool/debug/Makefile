@@ -27,7 +27,7 @@ ThreadQueue_LIBINCPATH		= -I $(LIBFILE_PATH)/ThreadQueue/include
 # 编译选项
 # ==============================================================================
 # -g: 调试信息; -Wall: 常见警告; -Wextra: 额外警告
-CFLAGS  = -g -Wall -Wextra
+CFLAGS  = -g -Wall -Wextra -pthread
 CFLAGS  := $(CFLAGS) $(ThreadQueue_LIBINCPATH)
 
 # 位置无关代码（动态库必需）

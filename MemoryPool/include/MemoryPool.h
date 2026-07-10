@@ -97,7 +97,7 @@ typedef enum
 /**
  * @struct       T_MemPoolConfig
  * @brief        内存池配置参数（Init 时传入）
- * @details      element_size 经内部对齐补齐（max_align_t）后作为实际槽位大小，
+ * @details      element_size 经内部对齐补齐（按平台最大常用类型）后作为实际槽位大小，
  *               保证返回地址可存任意类型。Init 时 cfg 为 NULL 用默认值。
  */
 typedef struct T_MEMPOOLCONFIG
@@ -117,7 +117,7 @@ typedef struct T_MEMPOOLSTATS
 {
     unsigned long ulTotalAlloc;   /**< 累计 Alloc 成功次数 */
     unsigned long ulTotalFree;    /**< 累计 Free 归还次数 */
-    unsigned long ulTotalDrop;    /**< 累计 DROP 丢弃次数(池满返回 NULL) */
+    unsigned long ulTotalDrop;    /**< 累计返回NULL次数：DROP池满 + BLOCK超时 + GROW扩容失败 */
     unsigned long ulTotalGrow;    /**< 累计 GROW 扩容槽位数 */
     int           iPeakUsed;      /**< 峰值已用槽位数 */
     int           iCapacity;      /**< 总容量(含 GROW 扩容，槽位数) */
