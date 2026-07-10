@@ -175,3 +175,34 @@ MemoryPool/
 ---
 
 > MemoryPool 经需求→实现→x86/arm 验证→多线程压测→init 扫描调优完整闭环，三模式 + 配合队列循环复用 + 峰值监控全部验证可靠。
+
+---
+
+## 九、变更记录
+
+### 2026-07-10：第一轮 AI 审查修复（见 `AI审查结果.md`）
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | BLOCK 超时 stolen wakeup（ETIMEDOUT 后直接返回 NULL，未重判 free_list） | ETIMEDOUT 后持锁重判 `free_list`，仍空才返回 NULL，否则 break 走正常分配 |
+| 2 | 乘法溢出（32 位 `count×align_size` 溢出→堆溢出） | 新增 `mp_size_overflow()`，Init/GROW 在 `malloc` 前校验 |
+| 3 | GROW malloc 失败未计入统计 | 两处失败分支补 `total_drop++` |
+| 4 | `ulTotalDrop` 语义模糊（DROP 丢弃 + BLOCK 超时混计） | 头文件注释说明复合语义 |
+| 6 | Init 未校验 mode 范围 / 负 block_timeo | 加 mode 范围(0~2)校验 + block_timeo 负值处理 |
+| 8 | Makefile CFLAGS 缺 `-pthread` | CFLAGS 补 `-pthread`（编译+链接都带） |
+| 11 | 头文件对齐注释写 "max_align_t"（实现用 union 近似） | 改为"按平台最大常用类型" |
+
+### 2026-07-10：第二轮审查修复（修复后复核）
+
+| # | 问题 | 修复 |
+|---|------|------|
+| A | `block_timeo` 负值夹紧到 0 = 无限阻塞（静默挂起，且与 `AllocBlock` 显式接口不一致） | 改为 Init **拒绝**（负值返回 -1），统一"负值=失败" |
+| 1 | `timedwait` 返回非 ETIMEDOUT 错误（EINVAL 等）时忙等空转 | 加 `else if(r != 0 && r != EINTR)` → `total_drop++` + 返回 NULL（EINTR 继续等，EINVAL 不忙等） |
+
+**未改（审查确认保持现状）**：
+- 问题 5（Destroy 未 broadcast）—— `@warning` 文档兜底，与 ThreadQueue/StreamBuffer 一致
+- 问题 7（printf 日志）—— 与现有库一致
+- 问题 9（clock_gettime 返回值）—— 修复 2 已断联动（EINVAL→返回 NULL 不忙等），Linux 保证不失败
+- 问题 10/12-14 —— 防御性/风格，低优先
+
+**审查结论**：*"可投入生产。核心并发与生命周期逻辑无致命缺陷。"*
