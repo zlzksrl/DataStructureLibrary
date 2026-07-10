@@ -228,7 +228,7 @@ int WindowQueueAPI_Put(T_WindowQueueMsg *pt_QueueMsg, const void *data);
  *               拷贝在互斥锁内完成后立即释放锁，用户可在锁外对 out_buf 排序/求和，
  *               不阻塞采集线程。零内部 malloc。
  * @param[in]    pt_QueueMsg: 队列句柄
- * @param[out]   out_buf:     用户提供的输出缓冲，至少需 返回值×element_size 字节，不能为 NULL
+ * @param[out]   out_buf:     用户提供的输出缓冲，至少需 max_count×element_size 字节，不能为 NULL
  * @param[in]    max_count:   期望拷贝的最大条数，必须 > 0
  * @return       int ret
  * @retval       >=0: 实际拷贝的条数 n（0 <= n <= min(max_count, nData)）

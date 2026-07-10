@@ -405,7 +405,7 @@ int WindowQueueAPI_Resize(T_WindowQueueMsg *pt_QueueMsg, int new_size)
     if(move > new_size)
     {
         int drop = pt_QueueMsg->nData - new_size;
-        pt_QueueMsg->ulTotalDiscarded += (unsigned long)drop;
+        /* 缩容丢弃不计入 ulTotalDiscarded（那是"满则丢老"丢包率，非用户主动缩容）*/
         pt_QueueMsg->lget = (pt_QueueMsg->lget + drop) % pt_QueueMsg->size;
         move = new_size;
     }
