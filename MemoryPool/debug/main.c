@@ -1,10 +1,9 @@
 /**
  * @file        main.c
  * @brief       MemoryPool 内存池 - 测试/演示程序
- * @details     演示三种池满策略：
- *              Part 1: DROP  —— 池满返回 NULL（统计丢弃）
- *              Part 2: GROW  —— 池满动态扩容（capacity 增长）
- *              Part 3: BLOCK —— 池满阻塞等待（Free 唤醒）
+ * @details     Part 1-3: 单线程三模式基础（DROP/GROW/BLOCK 基本功能）
+ *              Part 4-6: 多线程 + ThreadQueue 三模式压测 10×1000
+ *                        （BLOCK 阻塞 / GROW 扩容 / DROP 丢弃，都走 alloc→PutMsg→GetMsg→Free）
  *
  * @author      zlzksrl
  * @Version     V1.0.0
@@ -24,10 +23,6 @@
 /* ========================== 调试宏 ========================== */
 
 #if 1
-/**
- * @def   Debug_printx
- * @brief 调试打印宏（将 #if 1 改为 0 可关闭）
- */
 #define Debug_printx(format,...)\
                 do\
                 {\
@@ -43,10 +38,11 @@
 
 /* ================================================================== */
 /*                                                                    */
-/*     Part 1: DROP（池满返回 NULL）                                   */
+/*     Part 1-3: 单线程三模式基础                                      */
 /*                                                                    */
 /* ================================================================== */
 
+/* ---- Part 1: DROP（池满返回 NULL） ---- */
 static void test_drop(void)
 {
     T_MemPoolConfig cfg = { (int)sizeof(int), 8, MEMPOOL_MODE_DROP, 0, 0 };
@@ -56,38 +52,19 @@ static void test_drop(void)
     T_MemPoolStats st;
 
     MemPoolAPI_Init(&p, &cfg, "drop");
-
-    /* 申请 12 个，容量 8 → 前 8 成功、后 4 返回 NULL */
     for(i = 0; i < 12; i++)
     {
         slots[i] = MemPoolAPI_Alloc(p);
-        if(slots[i])
-        {
-            *(int *)slots[i] = i;
-        }
+        if(slots[i]) *(int *)slots[i] = i;
     }
     MemPoolAPI_StatsGet(p, &st);
     Debug_printx("DROP: alloc=%lu drop=%lu capacity=%d (expect alloc=8 drop=4)",
                  st.ulTotalAlloc, st.ulTotalDrop, st.iCapacity);
-
-    /* 归还全部 */
-    for(i = 0; i < 12; i++)
-    {
-        if(slots[i])
-        {
-            MemPoolAPI_Free(p, slots[i]);
-        }
-    }
+    for(i = 0; i < 12; i++) if(slots[i]) MemPoolAPI_Free(p, slots[i]);
     MemPoolAPI_Destroy(&p);
 }
 
-
-/* ================================================================== */
-/*                                                                    */
-/*     Part 2: GROW（池满动态扩容）                                    */
-/*                                                                    */
-/* ================================================================== */
-
+/* ---- Part 2: GROW（池满动态扩容） ---- */
 static void test_grow(void)
 {
     T_MemPoolConfig cfg = { (int)sizeof(int), 4, MEMPOOL_MODE_GROW, 4, 0 };
@@ -97,56 +74,29 @@ static void test_grow(void)
     T_MemPoolStats st;
 
     MemPoolAPI_Init(&p, &cfg, "grow");
-
-    /* 申请 12 个，初始 4 + 每次扩容 4 → 全部成功，capacity 增长到 12 */
     for(i = 0; i < 12; i++)
     {
-        slots[i] = MemPoolAPI_AllocGrow(p);
-        if(slots[i])
-        {
-            *(int *)slots[i] = i;
-        }
+        slots[i] = MemPoolAPI_Alloc(p);
+        if(slots[i]) *(int *)slots[i] = i;
     }
     MemPoolAPI_StatsGet(p, &st);
     Debug_printx("GROW: alloc=%lu capacity=%d grow=%lu (expect alloc=12 capacity=12)",
                  st.ulTotalAlloc, st.iCapacity, st.ulTotalGrow);
-
-    for(i = 0; i < 12; i++)
-    {
-        if(slots[i])
-        {
-            MemPoolAPI_Free(p, slots[i]);
-        }
-    }
+    for(i = 0; i < 12; i++) if(slots[i]) MemPoolAPI_Free(p, slots[i]);
     MemPoolAPI_Destroy(&p);
 }
 
-
-/* ================================================================== */
-/*                                                                    */
-/*     Part 3: BLOCK（池满阻塞等待，Free 唤醒）                        */
-/*                                                                    */
-/* ================================================================== */
-
+/* ---- Part 3: BLOCK（池满阻塞 + Free 唤醒） ---- */
 static T_MemPool *g_pool = NULL;
-
-/**
- * @func         blocker_thread
- * @brief        阻塞线程：在池满时 AllocBlock(0) 无限等待，被 Free 唤醒后返回
- */
 static void *blocker_thread(void *arg)
 {
     void *s;
     (void)arg;
-    s = MemPoolAPI_AllocBlock(g_pool, 0);   /* 池满，无限阻塞等 */
+    s = MemPoolAPI_AllocBlock(g_pool, 0);   /* 无限阻塞等 */
     Debug_printx("blocker: got slot=%p after woken", s);
-    if(s)
-    {
-        MemPoolAPI_Free(g_pool, s);
-    }
+    if(s) MemPoolAPI_Free(g_pool, s);
     return NULL;
 }
-
 static void test_block(void)
 {
     T_MemPoolConfig cfg = { (int)sizeof(int), 4, MEMPOOL_MODE_BLOCK, 0, 0 };
@@ -155,36 +105,25 @@ static void test_block(void)
     int i;
 
     MemPoolAPI_Init(&g_pool, &cfg, "block");
-
-    /* 先占满 4 个 */
-    for(i = 0; i < 4; i++)
-    {
-        slots[i] = MemPoolAPI_Alloc(g_pool);
-    }
+    for(i = 0; i < 4; i++) slots[i] = MemPoolAPI_Alloc(g_pool);
     Debug_printx("BLOCK: pool full (4/4), start blocker thread");
-
-    /* 启动阻塞线程：它会 AllocBlock 无限等 */
     pthread_create(&tid, NULL, blocker_thread, NULL);
-    usleep(100 * 1000);   /* 等 blocker 进入阻塞 */
-
-    /* Free 一个 → signal 唤醒 blocker */
+    usleep(100 * 1000);
     Debug_printx("BLOCK: free one slot to wake blocker");
     MemPoolAPI_Free(g_pool, slots[0]);
-
     pthread_join(tid, NULL);
-
-    /* 归还剩余 */
-    for(i = 1; i < 4; i++)
-    {
-        MemPoolAPI_Free(g_pool, slots[i]);
-    }
+    for(i = 1; i < 4; i++) MemPoolAPI_Free(g_pool, slots[i]);
     MemPoolAPI_Destroy(&g_pool);
 }
 
 
 /* ================================================================== */
 /*                                                                    */
-/*     Part 4: 配合 ThreadQueue（Alloc→PutMsg→GetMsg→Free 循环复用）  */
+/*     Part 4-6: 多线程 + ThreadQueue 三模式压测 10×1000              */
+/*                                                                    */
+/*  producer: Alloc(按cfg.mode) → 填数据 → PutMsg                     */
+/*  consumer: GetMsg → 用数据 → Free(归还池)                          */
+/*  三模式：BLOCK(满则阻塞等) / GROW(满则扩容) / DROP(满则丢弃)       */
 /*                                                                    */
 /* ================================================================== */
 
@@ -199,67 +138,81 @@ static void q_release(void *data)
     MemPoolAPI_Free(g_qpool, data);
 }
 
-/* 生产者：Alloc(池取) → 填数据 → PutMsg(入队) */
+static volatile int g_prod_done = 0;   /* 生产者产完标志 */
+
+/* 生产者：Alloc(按 cfg.mode) → 填数据 → PutMsg */
 static void *q_producer(void *arg)
 {
     int N = *(int *)arg;
     int i;
     for(i = 0; i < N; i++)
     {
-        T_QMsg *m = (T_QMsg *)MemPoolAPI_AllocBlock(g_qpool, 0);   /* 池满则阻塞等 */
-        m->id  = i;
-        m->val = i * 10;
-        ThreadQueueAPI_PutMsg(g_q, m);
+        T_QMsg *m = (T_QMsg *)MemPoolAPI_Alloc(g_qpool);   /* BLOCK/GROW/DROP 按 cfg.mode */
+        if(m != NULL)              /* DROP 模式可能返回 NULL（丢弃，不入队） */
+        {
+            m->id  = i;
+            m->val = i * 10;
+            ThreadQueueAPI_PutMsg(g_q, m);
+        }
     }
+    g_prod_done = 1;               /* 产完，通知消费者 */
     return NULL;
 }
 
-/* 消费者：GetMsg(取) → 用数据 → Free(归还池) */
+/* 消费者：GetMsg → Free(归还池)；产完且超时无数据则退出 */
 static void *q_consumer(void *arg)
 {
-    int N = *(int *)arg;
-    int i;
-    for(i = 0; i < N; i++)
+    (void)arg;
+    while(1)
     {
-        T_QMsg *m = (T_QMsg *)ThreadQueueAPI_GetMsg(g_q, 1000);
+        T_QMsg *m = (T_QMsg *)ThreadQueueAPI_GetMsg(g_q, 100);  /* 100ms 超时 */
         if(m != NULL)
         {
-            MemPoolAPI_Free(g_qpool, m);   /* 归还池，循环复用 */
+            MemPoolAPI_Free(g_qpool, m);
+        }
+        else if(g_prod_done)
+        {
+            break;   /* 生产者已产完 + 超时无数据 → 退出 */
         }
     }
     return NULL;
 }
 
-static void test_with_threadqueue(void)
+/**
+ * @func         test_pool_queue_stress
+ * @brief        多线程+队列压测：指定模式跑 10 轮 × 1000 条
+ */
+static void test_pool_queue_stress(MemPoolMode mode, const char *name)
 {
-    T_MemPoolConfig pcfg = { (int)sizeof(T_QMsg), 8, MEMPOOL_MODE_BLOCK, 0, 0 };
-    int N = 1000;        /* 每轮入队/出队条数 */
-    int ROUNDS = 10;     /* 频繁测试轮数（共 N×ROUNDS 次流转） */
+    T_MemPoolConfig pcfg = { (int)sizeof(T_QMsg), 8, mode, 4, 0 };  /* init 8, grow 4, block_timeo 0 */
+    int N = 1000;
+    int ROUNDS = 10;
     int r;
     pthread_t tp, tc;
     T_MemPoolStats st;
 
-    MemPoolAPI_Init(&g_qpool, &pcfg, "qpool");
-    ThreadQueueAPI_InitMsg(&g_q, 100, "q", q_release);   /* 队列残留→归还池 */
+    MemPoolAPI_Init(&g_qpool, &pcfg, name);
+    ThreadQueueAPI_InitMsg(&g_q, 100, name, q_release);
 
-    /* 多轮频繁测试：每轮 N 条入队/出队，验证池循环复用长期稳定 */
     for(r = 0; r < ROUNDS; r++)
     {
+        g_prod_done = 0;
         pthread_create(&tp, NULL, q_producer, &N);
-        pthread_create(&tc, NULL, q_consumer, &N);
+        pthread_create(&tc, NULL, q_consumer, NULL);
         pthread_join(tp, NULL);
         pthread_join(tc, NULL);
         MemPoolAPI_StatsGet(g_qpool, &st);
-        Debug_printx("POOL+QUEUE round %d/%d: alloc=%lu free=%lu capacity=%d peak=%d",
-                     r + 1, ROUNDS, st.ulTotalAlloc, st.ulTotalFree, st.iCapacity, st.iPeakUsed);
+        Debug_printx("%s round %d/%d: alloc=%lu free=%lu drop=%lu grow=%lu cap=%d peak=%d",
+                     name, r + 1, ROUNDS, st.ulTotalAlloc, st.ulTotalFree,
+                     st.ulTotalDrop, st.ulTotalGrow, st.iCapacity, st.iPeakUsed);
     }
 
-    /* 最终校验：累计 alloc==free==N*ROUNDS，capacity 恒定 8（无泄漏、无扩容） */
     MemPoolAPI_StatsGet(g_qpool, &st);
-    Debug_printx("POOL+QUEUE total: alloc=%lu free=%lu capacity=%d peak=%d (expect alloc=free=%d capacity=8)",
-                 st.ulTotalAlloc, st.ulTotalFree, st.iCapacity, st.iPeakUsed, N * ROUNDS);
+    Debug_printx("%s total: alloc=%lu free=%lu drop=%lu grow=%lu cap=%d peak=%d",
+                 name, st.ulTotalAlloc, st.ulTotalFree,
+                 st.ulTotalDrop, st.ulTotalGrow, st.iCapacity, st.iPeakUsed);
 
-    /* 优雅关闭队列：Close → Flush(残留归还池) → Destroy（避免 Destroy 警告） */
+    /* 优雅关闭队列 */
     ThreadQueueAPI_CloseMsg(g_q);
     ThreadQueueAPI_FlushMsg(g_q, q_release);
     ThreadQueueAPI_DestroyMsg(&g_q);
@@ -269,70 +222,51 @@ static void test_with_threadqueue(void)
 
 /* ================================================================== */
 /*                                                                    */
-/*     Part 5: GROW 扩容压测（10000 次，打印 peak）                    */
+/*     Part 7-8: init_count 扫描（找"不丢/不扩"的最小 init）          */
 /*                                                                    */
 /* ================================================================== */
 
-static void test_grow_stress(void)
+/**
+ * @func         test_init_scan
+ * @brief        扫描不同 init_count，找 drop=0(DROP) 或 grow=0(GROW) 的最小 init
+ */
+static void test_init_scan(MemPoolMode mode, const char *name)
 {
-    T_MemPoolConfig cfg = { (int)sizeof(int), 4, MEMPOOL_MODE_GROW, 4, 0 };
-    T_MemPool *p = NULL;
-    int N = 10000;
-    void **slots;
-    int i;
-    T_MemPoolStats st;
+    int inits[] = {8, 16, 32, 64, 128, 256, 512, 1024};
+    int n = (int)(sizeof(inits) / sizeof(inits[0]));
+    int N = 1000;
+    int k;
 
-    slots = (void **)malloc((size_t)N * sizeof(void *));
-    if(slots == NULL) return;
-    MemPoolAPI_Init(&p, &cfg, "grow_stress");
-    for(i = 0; i < N; i++)
+    Debug_printx("=== %s init_count scan (N=%d per init) ===", name, N);
+    for(k = 0; k < n; k++)
     {
-        slots[i] = MemPoolAPI_AllocGrow(p);   /* 满则扩容 */
-    }
-    MemPoolAPI_StatsGet(p, &st);
-    Debug_printx("GROW stress N=%d: alloc=%lu capacity=%d grow=%lu peak=%d",
-                 N, st.ulTotalAlloc, st.iCapacity, st.ulTotalGrow, st.iPeakUsed);
-    for(i = 0; i < N; i++)
-    {
-        if(slots[i]) MemPoolAPI_Free(p, slots[i]);
-    }
-    MemPoolAPI_Destroy(&p);
-    free(slots);
-}
+        T_MemPoolConfig pcfg = { (int)sizeof(T_QMsg), inits[k], mode, 4, 0 };
+        T_MemPoolStats st;
+        pthread_t tp, tc;
+        const char *tag;
 
+        MemPoolAPI_Init(&g_qpool, &pcfg, "scan");
+        ThreadQueueAPI_InitMsg(&g_q, 2000, "scanq", q_release);   /* 队列大，不限制 */
 
-/* ================================================================== */
-/*                                                                    */
-/*     Part 6: DROP 丢弃压测（10000 次，打印 peak）                    */
-/*                                                                    */
-/* ================================================================== */
+        g_prod_done = 0;
+        pthread_create(&tp, NULL, q_producer, &N);
+        pthread_create(&tc, NULL, q_consumer, NULL);
+        pthread_join(tp, NULL);
+        pthread_join(tc, NULL);
 
-static void test_drop_stress(void)
-{
-    T_MemPoolConfig cfg = { (int)sizeof(int), 4, MEMPOOL_MODE_DROP, 0, 0 };
-    T_MemPool *p = NULL;
-    int N = 10000;
-    void **slots;
-    int i, got = 0;
-    T_MemPoolStats st;
+        MemPoolAPI_StatsGet(g_qpool, &st);
+        tag = (mode == MEMPOOL_MODE_DROP)
+              ? (st.ulTotalDrop == 0 ? "[OK no-drop]" : "")
+              : (st.ulTotalGrow == 0 ? "[OK no-grow]" : "");
+        Debug_printx("%s init=%-5d: alloc=%lu free=%lu drop=%lu grow=%lu cap=%d peak=%d %s",
+                     name, inits[k], st.ulTotalAlloc, st.ulTotalFree,
+                     st.ulTotalDrop, st.ulTotalGrow, st.iCapacity, st.iPeakUsed, tag);
 
-    slots = (void **)malloc((size_t)N * sizeof(void *));
-    if(slots == NULL) return;
-    MemPoolAPI_Init(&p, &cfg, "drop_stress");
-    for(i = 0; i < N; i++)
-    {
-        slots[i] = MemPoolAPI_AllocDrop(p);   /* 满则 NULL（丢弃） */
-        if(slots[i]) got++;
+        ThreadQueueAPI_CloseMsg(g_q);
+        ThreadQueueAPI_FlushMsg(g_q, q_release);
+        ThreadQueueAPI_DestroyMsg(&g_q);
+        MemPoolAPI_Destroy(&g_qpool);
     }
-    MemPoolAPI_StatsGet(p, &st);
-    Debug_printx("DROP stress N=%d: alloc=%lu drop=%lu capacity=%d peak=%d (got=%d)",
-                 N, st.ulTotalAlloc, st.ulTotalDrop, st.iCapacity, st.iPeakUsed, got);
-    for(i = 0; i < N; i++)
-    {
-        if(slots[i]) MemPoolAPI_Free(p, slots[i]);
-    }
-    MemPoolAPI_Destroy(&p);
-    free(slots);
 }
 
 
@@ -347,23 +281,29 @@ int main(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    Debug_printx("========== Part 1: DROP Start ==========");
+    Debug_printx("========== Part 1: DROP (single) ==========");
     test_drop();
 
-    Debug_printx("========== Part 2: GROW Start ==========");
+    Debug_printx("========== Part 2: GROW (single) ==========");
     test_grow();
 
-    Debug_printx("========== Part 3: BLOCK Start ==========");
+    Debug_printx("========== Part 3: BLOCK (single) ==========");
     test_block();
 
-    Debug_printx("========== Part 4: with ThreadQueue Start ==========");
-    test_with_threadqueue();
+    Debug_printx("========== Part 4: BLOCK + ThreadQueue (10x1000) ==========");
+    test_pool_queue_stress(MEMPOOL_MODE_BLOCK, "BLOCK-Q");
 
-    Debug_printx("========== Part 5: GROW stress Start ==========");
-    test_grow_stress();
+    Debug_printx("========== Part 5: GROW + ThreadQueue (10x1000) ==========");
+    test_pool_queue_stress(MEMPOOL_MODE_GROW, "GROW-Q");
 
-    Debug_printx("========== Part 6: DROP stress Start ==========");
-    test_drop_stress();
+    Debug_printx("========== Part 6: DROP + ThreadQueue (10x1000) ==========");
+    test_pool_queue_stress(MEMPOOL_MODE_DROP, "DROP-Q");
+
+    Debug_printx("========== Part 7: init_count scan (DROP) ==========");
+    test_init_scan(MEMPOOL_MODE_DROP, "DROP-scan");
+
+    Debug_printx("========== Part 8: init_count scan (GROW) ==========");
+    test_init_scan(MEMPOOL_MODE_GROW, "GROW-scan");
 
     Debug_printx("Program exit");
     return 0;
