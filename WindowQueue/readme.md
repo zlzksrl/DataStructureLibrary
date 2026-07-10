@@ -51,7 +51,7 @@ WindowQueue/
 ├── src/
 │   ├── WindowQueue_Main.h        # 内部结构体 T_WINDOWQUEUEMSG 定义
 │   ├── WindowQueue.c             # 核心实现（值拷贝环形缓冲 + 回调 + Resize）
-│   └── WindowQueue_Maketime.h    # Makefile 自动生成（不纳入版本控制）
+│   └── WindowQueue_Maketime.h    # Makefile 自动生成（建议加入 .gitignore）
 ├── debug/
 │   ├── main.c                     # 演示（ForEach 中值滤波 + Snapshot 均值 + 入队回调）
 │   └── Makefile                   # arm 交叉编译
@@ -148,6 +148,7 @@ typedef struct {
 |----|------|
 | `0` | 成功（Put 未丢弃） |
 | `-1` | 参数无效或未初始化 |
+| `-2` | 队列已关闭（仅 Put 返回） |
 | `>0` | 仅 Put：本次丢弃的最老数据条数（1） |
 
 ---
