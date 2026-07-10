@@ -369,8 +369,99 @@ int WindowQueueAPI_ForEach(T_WindowQueueMsg *pt_QueueMsg,
         callback(pt_QueueMsg->buffer + (size_t)idx * pt_QueueMsg->element_size, i, user_ctx);
     }
     int n = pt_QueueMsg->nData;
+
     pthread_mutex_unlock(&pt_QueueMsg->mux);
     return n;
+}
+
+/**
+ * @func         WindowQueueAPI_SnapshotAddress
+ * @brief        快照零拷贝（输出最新数据原始地址 + 实际条数）
+ * @details      加锁读取后不持锁返回。返回地址指向最新一条数据的内部位置。
+ */
+/**
+ * @func         WindowQueueAPI_SnapshotAddress
+ * @brief        快照零拷贝：构建指针数组（老→新，回绕处理好），不拷贝数据
+ * @details      加锁期间填充内部 view[] 指针数组（同 SetPutCallback 的 entries[]）：
+ *               out_buf[0] = 最老(lget)，out_buf[count-1] = 最新(lput-1)。
+ *               回绕已处理：每条按 (lget+i)%size 索引。
+ *               不持锁返回，调用者须保证使用期间无 Put。
+ */
+int WindowQueueAPI_SnapshotAddress(T_WindowQueueMsg *pt_QueueMsg,
+                                   void **out_buf, int *out_count)
+{
+    if(NULL == pt_QueueMsg || NULL == out_buf)
+    {
+        return -1;
+    }
+    if(!pt_QueueMsg->init_done)
+    {
+        *out_buf = NULL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&pt_QueueMsg->mux);
+
+    if(pt_QueueMsg->nData <= 0)
+    {
+        *out_buf = NULL;
+        if(out_count) *out_count = 0;
+        pthread_mutex_unlock(&pt_QueueMsg->mux);
+        return -1;
+    }
+
+    /* 构建 view[]：老→新，回绕处理好（与回调 entries[] 完全一致） */
+    int i;
+    for(i = 0; i < pt_QueueMsg->nData; i++)
+    {
+        int idx = (pt_QueueMsg->lget + i) % pt_QueueMsg->size;
+        pt_QueueMsg->view[i] = pt_QueueMsg->buffer + (size_t)idx * pt_QueueMsg->element_size;
+    }
+
+    *out_buf = pt_QueueMsg->view;   /* 返回指针数组首地址 */
+    if(out_count)
+    {
+        *out_count = pt_QueueMsg->nData;
+    }
+
+    pthread_mutex_unlock(&pt_QueueMsg->mux);
+    return 0;
+}
+
+/**
+ * @func         WindowQueueAPI_GetRawData
+ * @brief        获取原始数据地址（buffer 基地址 + 实际条数），不排序
+ * @details      返回内部 buffer 的基地址（unsigned char*），out_count 为当前条数。
+ *               用户按 element_size 步长访问 out_buf[0] ~ out_buf[count-1]。
+ *               不处理回绕、不排序——数据按物理存储顺序排列。
+ *               当队列未满（lget=0，无回绕）时，与 SnapshotAddress 返回的数据一致；
+ *               队列满后丢弃过老数据（lget!=0，回绕）后两者不同。
+ *               不持锁返回，调用者须保证使用期间无 Put。
+ */
+int WindowQueueAPI_GetRawData(T_WindowQueueMsg *pt_QueueMsg,
+                              void **out_buf, int *out_count)
+{
+    if(NULL == pt_QueueMsg || NULL == out_buf)
+    {
+        return -1;
+    }
+    if(!pt_QueueMsg->init_done)
+    {
+        *out_buf = NULL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&pt_QueueMsg->mux);
+
+    *out_buf = pt_QueueMsg->buffer;
+
+    if(out_count)
+    {
+        *out_count = pt_QueueMsg->nData;
+    }
+
+    pthread_mutex_unlock(&pt_QueueMsg->mux);
+    return 0;
 }
 
 

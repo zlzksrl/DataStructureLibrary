@@ -126,7 +126,7 @@ typedef struct {
 } T_WindowQueueStats;
 ```
 
-### API 一览（14 个）
+### API 一览（16 个）
 
 | 类别 | 函数 | 说明 |
 |------|------|------|
@@ -135,6 +135,8 @@ typedef struct {
 | | `Close` / `Reopen` / `IsClosed` | 关闭/重开/查询 |
 | 写入 | `Put` | 写入一条（满则丢最老，返回丢弃 0/1） |
 | 窗口访问 | `Snapshot` | 快照拷贝最新 N 条（锁内拷贝，锁外处理） |
+| | `SnapshotAddress` | 零拷贝：指针数组（老→新，回绕处理好） |
+| | `GetRawData` | 零拷贝：buffer 基地址（物理顺序，不排序） |
 | | `ForEach` | 锁内零拷贝遍历整个窗口 |
 | | `SetPutCallback` | 注册入队回调（每次 Put 后锁内触发） |
 | 容量 | `Resize` | 动态变长/变短（O(n) 阻塞） |
@@ -153,18 +155,24 @@ typedef struct {
 
 ---
 
-## 五、三种窗口访问方式
+## 五、五种窗口访问方式
 
-| 方式 | 函数 | 拷贝 | 回绕 | 调用方 |
-|------|------|------|------|--------|
-| **快照拷贝** | `Snapshot(buf,max)` | memcpy 到用户 buf | 合并两段 | 用户主动 |
-| **锁内零拷贝** | `ForEach(cb,ctx)` | 零拷贝（data 指向内部） | 顺序遍历 | 用户主动 |
-| **入队回调** | `SetPutCallback` | 零拷贝（view 指针数组） | 分段回调 | Put 后自动 |
+| 方式 | 函数 | 拷贝 | 回绕 | 排序 | 调用方 |
+|------|------|------|------|------|--------|
+| **快照拷贝** | `Snapshot(buf,max)` | memcpy 到用户 buf | 合并两段 | 老→新 | 用户主动 |
+| **快照零拷贝** | `SnapshotAddress(&ptr,&cnt)` | 零拷贝（指针数组） | 回绕处理好 | 老→新 | 用户主动 |
+| **原始零拷贝** | `GetRawData(&ptr,&cnt)` | 零拷贝（buffer 基地址） | 不处理 | 物理顺序 | 用户主动 |
+| **锁内零拷贝** | `ForEach(cb,ctx)` | 零拷贝（data 指向内部） | 顺序遍历 | 老→新 | 用户主动 |
+| **入队回调** | `SetPutCallback` | 零拷贝（view 指针数组） | 分段回调 | 老→新 | Put 后自动 |
 
-- Snapshot 适合**中值滤波**（需排序/随机访问，拷贝到连续数组后锁外处理）
-- ForEach 适合**移动平均**（顺序聚合，锁内零拷贝）
-- SetPutCallback 适合**入队即处理**（每条 Put 后自动触发，view 指针数组零拷贝）
-- 三种方式**可配合**（如回调消费大部分 + Snapshot 取零头）
+- **Snapshot** 适合**中值滤波**（需排序/随机访问，拷贝到连续数组后锁外处理）
+- **SnapshotAddress** 适合**极快读取**（指针数组老→新排好，零拷贝，不持锁）
+- **GetRawData** 适合**原始访问**（buffer 基地址，物理顺序，零拷贝，不持锁）
+- **ForEach** 适合**移动平均**（顺序聚合，锁内零拷贝）
+- **SetPutCallback** 适合**入队即处理**（每条 Put 后自动触发）
+- 五种方式**可配合**（如回调消费大部分 + Snapshot 取零头）
+
+> **SnapshotAddress vs GetRawData**：当队列未满（lget=0，无回绕）时两者数据**一致**；队列满后丢老（回绕）后**不同**——SnapshotAddress 重排为老→新，GetRawData 保持物理存储顺序。
 
 ---
 
@@ -216,9 +224,54 @@ Sensor s = { .ts = 0, .value = 3.14f };
 WindowQueueAPI_Put(q, &s);   /* 满则丢最老；入队后自动触发 on_put */
 ```
 
+### 零拷贝快照（SnapshotAddress + GetRawData）
+
+```c
+/* SnapshotAddress：指针数组，老→新排好，回绕处理好 */
+const void **arr; int count;
+WindowQueueAPI_SnapshotAddress(q, (void**)&arr, &count);
+/* arr[0]=最老, arr[count-1]=最新，直接读零拷贝 */
+for (int i = 0; i < count; i++)
+    printf("[%d] val=%.1f\n", i, ((const Sensor*)arr[i])->value);
+
+/* GetRawData：buffer 基地址，物理顺序（不排序） */
+unsigned char *raw; int count;
+WindowQueueAPI_GetRawData(q, (void**)&raw, &count);
+/* raw[0*es] ~ raw[(count-1)*es]，物理存储顺序 */
+```
+
+> ⚠️ 两个零拷贝接口均**不持锁返回**，使用期间须无 Put 并发（否则数据可能被覆盖）。
+
 ---
 
-## 七、构建系统
+## 七、测试结果
+
+### Part 1-3：中值滤波 + 均值 + 入队回调
+
+| 验证项 | 结果 |
+|--------|------|
+| 中值滤波抑制尖刺 | latest=30.188 → median=10.626 ✓ |
+| mean(pull) == mean(push) | 逐轮一致（零拷贝回调正确）✓ |
+| stats | totalPut=296 discarded=288 peakLen=8 ✓ |
+
+### Part 4：SnapshotAddress + GetRawData 零拷贝
+
+| 场景 | arm 结果 | 判定 |
+|------|---------|------|
+| **未满(5条)** snap_cnt=raw_cnt | 5, 5 | count=实际条数 ✓ |
+| **未满** snap==raw? | **1**（一致） | 未回绕时两者相同 ✓ |
+| **未满** snap[0..4] ts | 0,1,2,3,4 | 老→新有序 ✓ |
+| **满+回绕(12条)** snap_cnt=raw_cnt | 8, 8 | count=容量 ✓ |
+| **满+回绕** snap oldest/newest | ts=**4**, ts=**11** | 丢0-3保4-11 ✓ |
+| **满+回绕** raw[0]/raw[7] | ts=**8**, ts=**7** | 物理顺序（非老→新）✓ |
+| **满+回绕** snap==raw? | **0**（不同） | 回绕后顺序不同 ✓ |
+| **空队列** SnapshotAddress | ret=-1, ptr=NULL, cnt=0 | 正确拒绝 ✓ |
+
+> **关键验证**：未满时两个函数数据一致；满后回绕后不同（SnapshotAddress 老→新重排，GetRawData 物理顺序）。
+
+---
+
+## 八、构建系统
 
 ```bash
 cd debug
@@ -229,11 +282,19 @@ make clean
 
 ---
 
-## 八、变更记录
+## 九、变更记录
 
 ### 2026-07-09：创建（V1.0.0）
 
 值拷贝环形缓冲区 + 三种窗口访问 + 入队回调 + 动态 Resize + 运行统计。
+
+### 2026-07-10：新增零拷贝接口（V1.1.0）
+
+新增 2 个零拷贝地址接口：
+- `SnapshotAddress`：构建指针数组（老→新，回绕处理好），返回 view[] 首地址
+- `GetRawData`：返回 buffer 基地址（物理顺序，不排序）
+
+> 未满时两者数据一致；满后回绕后不同。不持锁返回，用于极快读取场景。
 
 ### 2026-07-10：初审修复（AI审查.md）
 

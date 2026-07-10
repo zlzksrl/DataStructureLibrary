@@ -397,8 +397,108 @@ int main(int argc, char **argv)
     }
 
     /* 步骤6: Flush 残留窗口数据并销毁 */
-    WindowQueueAPI_Flush(q, NULL, NULL);   /* 无需处理残留（值拷贝），传NULL即可 */
+    WindowQueueAPI_Flush(q, NULL, NULL);
     WindowQueueAPI_Destroy(&q);
     Debug_printx("Destroy OK, program exit");
+
+    /* ============================================================== */
+    /* Part 4: SnapshotAddress + GetRawData 零拷贝测试                  */
+    /* ============================================================== */
+    Debug_printx("========== Part 4: SnapshotAddress + GetRawData ==========");
+
+    {
+        T_WindowQueueMsg *tq = NULL;
+        int cap = 8;
+        int i;
+        ret = WindowQueueAPI_Init(&tq, cap, (int)sizeof(Sensor), "testAddr");
+        if(ret != 0) { Debug_printx("Init fail"); return -1; }
+
+        /* ---- 场景1: 未满（写5条），SnapshotAddress == GetRawData ---- */
+        for(i = 0; i < 5; i++)
+        {
+            Sensor s = { .ts = i, .value = (float)(i * 10) };
+            WindowQueueAPI_Put(tq, &s);
+        }
+
+        {
+            const void **snap_arr = NULL;
+            unsigned char *raw_buf = NULL;
+            int snap_cnt = 0, raw_cnt = 0;
+
+            WindowQueueAPI_SnapshotAddress(tq, (void**)&snap_arr, &snap_cnt);
+            WindowQueueAPI_GetRawData(tq, (void**)&raw_buf, &raw_cnt);
+
+            Debug_printx("NotFull(5): snap_cnt=%d raw_cnt=%d (expect 5,5)", snap_cnt, raw_cnt);
+
+            /* 逐条比对：未满时两者应一致 */
+            int same = 1;
+            for(i = 0; i < snap_cnt; i++)
+            {
+                const Sensor *ss = (const Sensor *)snap_arr[i];
+                const Sensor *rr = (const Sensor *)(raw_buf + (size_t)i * sizeof(Sensor));
+                if(ss->ts != rr->ts || ss->value != rr->value) { same = 0; break; }
+            }
+            Debug_printx("NotFull: snap==raw? %d (expect 1)", same);
+
+            /* 打印 SnapshotAddress 老→新 */
+            for(i = 0; i < snap_cnt; i++)
+            {
+                const Sensor *s = (const Sensor *)snap_arr[i];
+                Debug_printx("snap[%d] ts=%d val=%.0f", i, s->ts, s->value);
+            }
+        }
+
+        /* ---- 场景2: 写满+丢老（写12条，cap=8），SnapshotAddress != GetRawData ---- */
+        for(i = 5; i < 12; i++)
+        {
+            Sensor s = { .ts = i, .value = (float)(i * 10) };
+            WindowQueueAPI_Put(tq, &s);
+        }
+
+        {
+            const void **snap_arr = NULL;
+            unsigned char *raw_buf = NULL;
+            int snap_cnt = 0, raw_cnt = 0;
+
+            WindowQueueAPI_SnapshotAddress(tq, (void**)&snap_arr, &snap_cnt);
+            WindowQueueAPI_GetRawData(tq, (void**)&raw_buf, &raw_cnt);
+
+            Debug_printx("Full+wrap(12): snap_cnt=%d raw_cnt=%d (expect 8,8)", snap_cnt, raw_cnt);
+
+            /* SnapshotAddress 老→新应为 ts=4..11 */
+            Debug_printx("snap oldest ts=%d, newest ts=%d (expect 4,11)",
+                         ((const Sensor *)snap_arr[0])->ts,
+                         ((const Sensor *)snap_arr[snap_cnt - 1])->ts);
+
+            /* GetRawData 物理顺序 ts（无序） */
+            Debug_printx("raw[0] ts=%d raw[7] ts=%d",
+                         ((const Sensor *)(raw_buf + 0))->ts,
+                         ((const Sensor *)(raw_buf + 7 * sizeof(Sensor)))->ts);
+
+            /* 比对：满后回绕，两者应不同 */
+            int same = 1;
+            for(i = 0; i < snap_cnt; i++)
+            {
+                const Sensor *ss = (const Sensor *)snap_arr[i];
+                const Sensor *rr = (const Sensor *)(raw_buf + (size_t)i * sizeof(Sensor));
+                if(ss->ts != rr->ts) { same = 0; break; }
+            }
+            Debug_printx("Full+wrap: snap==raw? %d (expect 0, should differ)", same);
+        }
+
+        /* ---- 场景3: 空队列 ---- */
+        WindowQueueAPI_Flush(tq, NULL, NULL);
+        {
+            void *ptr = (void*)0xDEAD;
+            int cnt = -1;
+            int r = WindowQueueAPI_SnapshotAddress(tq, &ptr, &cnt);
+            Debug_printx("Empty: SnapshotAddress ret=%d ptr=%p cnt=%d (expect -1, NULL, 0)", r, ptr, cnt);
+        }
+
+        WindowQueueAPI_Destroy(&tq);
+        Debug_printx("========== Part 4 End ==========");
+    }
+
+    Debug_printx("Program exit");
     return 0;
 }

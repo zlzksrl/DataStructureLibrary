@@ -242,6 +242,61 @@ int WindowQueueAPI_Snapshot(T_WindowQueueMsg *pt_QueueMsg,
                             void *out_buf, int max_count);
 
 /**
+ * @func         WindowQueueAPI_SnapshotAddress
+ * @brief        滑动窗口队列API-零拷贝快照（指针数组，老→新，回绕处理好）
+ * @details      加锁期间填充内部 view[] 指针数组（与 SetPutCallback 的 entries[] 完全一致）：
+ *               - out_buf[0] = 最老数据地址（lget 位置）
+ *               - out_buf[count-1] = 最新数据地址（lput-1 位置）
+ *               - 回绕已处理：每条按 (lget+i)%size 索引，用户无需关心环形边界
+ *               **零拷贝**：返回的是指向内部数据的指针数组，不拷贝数据本身。
+ *               **不持锁返回**：使用期间须无 Put 并发。
+ *
+ *               当队列未满（lget=0，无回绕）时，与 GetRawData 返回的数据一致。
+ *
+ * @param[in]    pt_QueueMsg: 队列句柄
+ * @param[out]   out_buf:     输出指针数组首地址（二级指针），不能为 NULL；
+ *                            用户以 ((const void**)*out_buf)[i] 访问第 i 条
+ * @param[out]   out_count:   输出当前窗口数据条数（0 <= count <= size），可为 NULL
+ * @return       int ret
+ * @retval       0:   成功
+ * @retval       -1:  参数无效、未初始化或窗口为空（*out_buf 置 NULL）
+ * @warning      返回的指针数组在下次 Put 后可能失效（数据被覆盖）；必须在无 Put 并发时使用
+ * @author       zlzksrl
+ * @date         2026-07-10
+ * @Version      V1.1.0
+ */
+int WindowQueueAPI_SnapshotAddress(T_WindowQueueMsg *pt_QueueMsg,
+                                   void **out_buf, int *out_count);
+
+/**
+ * @func         WindowQueueAPI_GetRawData
+ * @brief        滑动窗口队列API-获取原始 buffer 地址（不排序，不管老→新）
+ * @details      返回内部环形缓冲区的**基地址**（buffer[0]），out_count 为当前条数。
+ *               用户按 element_size 步长访问 out_buf[0] ~ out_buf[count-1]。
+ *               **不处理回绕、不排序**——数据按物理存储顺序排列。
+ *
+ *               当队列未满（lget=0，无回绕）时，buffer[0..count-1] 本身就是老→新，
+ *               与 SnapshotAddress 返回的数据**一致**；
+ *               队列满后丢弃过老数据（lget!=0，回绕）后两者**不同**（SnapshotAddress
+ *               重排为老→新，GetRawData 保持物理顺序）。
+ *
+ *               **不持锁返回**：使用期间须无 Put/Resize 并发。
+ * @param[in]    pt_QueueMsg: 队列句柄
+ * @param[out]   out_buf:     输出 buffer 基地址（二级指针），不能为 NULL；
+ *                            用户以 ((unsigned char*)*out_buf)[i*element_size] 访问
+ * @param[out]   out_count:   输出当前窗口数据条数，可为 NULL
+ * @return       int ret
+ * @retval       0:   成功
+ * @retval       -1:  参数无效或未初始化
+ * @warning      返回地址在下次 Put/Resize 后可能失效；必须在无 Put 并发时使用
+ * @author       zlzksrl
+ * @date         2026-07-10
+ * @Version      V1.1.0
+ */
+int WindowQueueAPI_GetRawData(T_WindowQueueMsg *pt_QueueMsg,
+                              void **out_buf, int *out_count);
+
+/**
  * @func         WindowQueueAPI_ForEach
  * @brief        滑动窗口队列API-回调遍历整个窗口（只读，零拷贝）
  * @details      按 老→新 顺序，对窗口中每条数据调用一次 callback。
