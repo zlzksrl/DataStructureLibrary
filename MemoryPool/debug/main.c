@@ -250,20 +250,89 @@ static void test_with_threadqueue(void)
         pthread_join(tp, NULL);
         pthread_join(tc, NULL);
         MemPoolAPI_StatsGet(g_qpool, &st);
-        Debug_printx("POOL+QUEUE round %d/%d: alloc=%lu free=%lu capacity=%d",
-                     r + 1, ROUNDS, st.ulTotalAlloc, st.ulTotalFree, st.iCapacity);
+        Debug_printx("POOL+QUEUE round %d/%d: alloc=%lu free=%lu capacity=%d peak=%d",
+                     r + 1, ROUNDS, st.ulTotalAlloc, st.ulTotalFree, st.iCapacity, st.iPeakUsed);
     }
 
     /* 最终校验：累计 alloc==free==N*ROUNDS，capacity 恒定 8（无泄漏、无扩容） */
     MemPoolAPI_StatsGet(g_qpool, &st);
-    Debug_printx("POOL+QUEUE total: alloc=%lu free=%lu capacity=%d (expect alloc=free=%d capacity=8)",
-                 st.ulTotalAlloc, st.ulTotalFree, st.iCapacity, N * ROUNDS);
+    Debug_printx("POOL+QUEUE total: alloc=%lu free=%lu capacity=%d peak=%d (expect alloc=free=%d capacity=8)",
+                 st.ulTotalAlloc, st.ulTotalFree, st.iCapacity, st.iPeakUsed, N * ROUNDS);
 
     /* 优雅关闭队列：Close → Flush(残留归还池) → Destroy（避免 Destroy 警告） */
     ThreadQueueAPI_CloseMsg(g_q);
     ThreadQueueAPI_FlushMsg(g_q, q_release);
     ThreadQueueAPI_DestroyMsg(&g_q);
     MemPoolAPI_Destroy(&g_qpool);
+}
+
+
+/* ================================================================== */
+/*                                                                    */
+/*     Part 5: GROW 扩容压测（10000 次，打印 peak）                    */
+/*                                                                    */
+/* ================================================================== */
+
+static void test_grow_stress(void)
+{
+    T_MemPoolConfig cfg = { (int)sizeof(int), 4, MEMPOOL_MODE_GROW, 4, 0 };
+    T_MemPool *p = NULL;
+    int N = 10000;
+    void **slots;
+    int i;
+    T_MemPoolStats st;
+
+    slots = (void **)malloc((size_t)N * sizeof(void *));
+    if(slots == NULL) return;
+    MemPoolAPI_Init(&p, &cfg, "grow_stress");
+    for(i = 0; i < N; i++)
+    {
+        slots[i] = MemPoolAPI_AllocGrow(p);   /* 满则扩容 */
+    }
+    MemPoolAPI_StatsGet(p, &st);
+    Debug_printx("GROW stress N=%d: alloc=%lu capacity=%d grow=%lu peak=%d",
+                 N, st.ulTotalAlloc, st.iCapacity, st.ulTotalGrow, st.iPeakUsed);
+    for(i = 0; i < N; i++)
+    {
+        if(slots[i]) MemPoolAPI_Free(p, slots[i]);
+    }
+    MemPoolAPI_Destroy(&p);
+    free(slots);
+}
+
+
+/* ================================================================== */
+/*                                                                    */
+/*     Part 6: DROP 丢弃压测（10000 次，打印 peak）                    */
+/*                                                                    */
+/* ================================================================== */
+
+static void test_drop_stress(void)
+{
+    T_MemPoolConfig cfg = { (int)sizeof(int), 4, MEMPOOL_MODE_DROP, 0, 0 };
+    T_MemPool *p = NULL;
+    int N = 10000;
+    void **slots;
+    int i, got = 0;
+    T_MemPoolStats st;
+
+    slots = (void **)malloc((size_t)N * sizeof(void *));
+    if(slots == NULL) return;
+    MemPoolAPI_Init(&p, &cfg, "drop_stress");
+    for(i = 0; i < N; i++)
+    {
+        slots[i] = MemPoolAPI_AllocDrop(p);   /* 满则 NULL（丢弃） */
+        if(slots[i]) got++;
+    }
+    MemPoolAPI_StatsGet(p, &st);
+    Debug_printx("DROP stress N=%d: alloc=%lu drop=%lu capacity=%d peak=%d (got=%d)",
+                 N, st.ulTotalAlloc, st.ulTotalDrop, st.iCapacity, st.iPeakUsed, got);
+    for(i = 0; i < N; i++)
+    {
+        if(slots[i]) MemPoolAPI_Free(p, slots[i]);
+    }
+    MemPoolAPI_Destroy(&p);
+    free(slots);
 }
 
 
@@ -289,6 +358,12 @@ int main(int argc, char **argv)
 
     Debug_printx("========== Part 4: with ThreadQueue Start ==========");
     test_with_threadqueue();
+
+    Debug_printx("========== Part 5: GROW stress Start ==========");
+    test_grow_stress();
+
+    Debug_printx("========== Part 6: DROP stress Start ==========");
+    test_drop_stress();
 
     Debug_printx("Program exit");
     return 0;
