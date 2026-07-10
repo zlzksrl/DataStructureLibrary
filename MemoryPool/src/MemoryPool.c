@@ -160,10 +160,11 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
         printf("mode %d invalid fail ##%s->%d\n", mode, __FUNCTION__, __LINE__);
         return -1;
     }
-    /* ---- block_timeo 负值夹紧到 0 ---- */
+    /* ---- block_timeo 负值拒绝（避免静默无限挂起，统一负值=失败）---- */
     if(block_timeo < 0)
     {
-        block_timeo = 0;
+        printf("block_timeo < 0 fail ##%s->%d\n", __FUNCTION__, __LINE__);
+        return -1;
     }
 
     /* ---- 对齐：向上补齐到 MEMPOOL_ALIGN，且保证 >= sizeof(void*) ---- */
@@ -400,6 +401,12 @@ static void *mp_alloc_block(T_MemPool *p, int timeo)
                     return NULL;
                 }
                 break;                    /* 谓词已真，跳出走正常分配 */
+            }
+            else if(r != 0 && r != EINTR)  /* 非 ETIMEDOUT/EINTR 的意外错误：避免忙等空转 */
+            {
+                p->total_drop++;
+                pthread_mutex_unlock(&p->mux);
+                return NULL;
             }
         }
     }
