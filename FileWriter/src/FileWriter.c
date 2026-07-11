@@ -39,7 +39,7 @@ static int  fw_make_dirs(const char *path);
 static int  fw_build_paths_locked(T_FileWriter *fw);
 static int  fw_open_new_file_locked(T_FileWriter *fw);
 static int  fw_rotate_locked(T_FileWriter *fw);
-static int  fw_check_file_size_rotate_locked(T_FileWriter *fw, int bytes_written);
+static int  fw_check_file_size_rotate_locked(T_FileWriter *fw);
 static int  fw_check_daily_rotate_locked(T_FileWriter *fw);
 static int  fw_delete_oldest_locked(T_FileWriter *fw);
 static int  fw_get_ext_from_type(FileWriterType type, char *out, int out_len);
@@ -546,12 +546,11 @@ static int fw_rotate_locked(T_FileWriter *fw)
 
 /**
  * @func         fw_check_file_size_rotate_locked
- * @brief        更新已写字节数并按 max_file_size 触发轮转
- * @warning      调用前须持有 fw->file_lock；bytes_written 已在 fwrite 成功后统计
+ * @brief        按 max_file_size 触发轮转（file_written 由调用者在 fwrite 成功后累加）
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_check_file_size_rotate_locked(T_FileWriter *fw, int bytes_written)
+static int fw_check_file_size_rotate_locked(T_FileWriter *fw)
 {
-    (void)bytes_written;  /* 兼容旧签名；已在调用者处累加 file_written */
     if(fw->config.max_file_size > 0 && fw->file_written >= fw->config.max_file_size)
     {
         return fw_rotate_locked(fw);
@@ -634,7 +633,7 @@ static void *fw_consumer_thread(void *arg)
                 }
 
                 /* 大小触发的轮转（用累计 file_written 判断） */
-                fw_check_file_size_rotate_locked(fw, (int)w);
+                fw_check_file_size_rotate_locked(fw);
             }
 
             pthread_mutex_unlock(&fw->file_lock);
@@ -763,16 +762,20 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     fw_get_date_str(pt->current_date, sizeof(pt->current_date));
     pt->file_seq = 0;
 
-    /* StreamBuffer */
+    /* StreamBuffer（名字拼实例名，多实例日志可辨识） */
     memset(&sb_cfg, 0, sizeof(sb_cfg));
     sb_cfg.iCapacity   = (pt->config.buffer_capacity > 0) ? pt->config.buffer_capacity : FW_DEFAULT_BUFFER_CAPACITY;
     sb_cfg.iFlushBytes = (pt->config.flush_bytes     > 0) ? pt->config.flush_bytes     : FW_DEFAULT_FLUSH_BYTES;
-    if(StreamBufferAPI_Init(&pt->sb, &sb_cfg, "fw_sb") != 0)
     {
-        printf("StreamBuffer init fail ##%s->%d\n", __FUNCTION__, __LINE__);
-        pthread_mutex_destroy(&pt->file_lock);
-        free(pt);
-        return -1;
+        char sb_name[MAX_FILEWRITERNAME_LEN + 8];
+        snprintf(sb_name, sizeof(sb_name), "fw_%s_sb", pt->name);
+        if(StreamBufferAPI_Init(&pt->sb, &sb_cfg, sb_name) != 0)
+        {
+            printf("StreamBuffer init fail ##%s->%d\n", __FUNCTION__, __LINE__);
+            pthread_mutex_destroy(&pt->file_lock);
+            free(pt);
+            return -1;
+        }
     }
 
     /* flush_ms 未配置则用默认 */
@@ -817,14 +820,15 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
 
     if(ThreadAPI_ThreadCreate(&th_cfg) < 0)
     {
-        /* 非 root 时 SCHED_RR 常因权限失败，降级到默认策略 */
+        /* 非 root 时 SCHED_RR 常因权限失败，降级到默认调度策略（保留栈大小配置） */
         printf("ThreadCreate(SCHED_RR pri=%d) fail, fallback to default ##%s->%d\n",
                prio, __FUNCTION__, __LINE__);
         memset(&th_cfg, 0, sizeof(th_cfg));
         th_cfg.pThreadFunc        = fw_consumer_thread;
         th_cfg.pThreadFuncUserArg = pt;
         th_cfg.sThreadName        = pt->name;
-        th_cfg.eSetAttr           = 0;                     /* 默认属性 */
+        th_cfg.eSetAttr           = 1;                     /* 仅配置栈大小，调度用继承 */
+        th_cfg.istacksize_MB      = 2;
         th_cfg.eDetachState       = PTHREAD_CREATE_JOINABLE;
 
         if(ThreadAPI_ThreadCreate(&th_cfg) < 0)
@@ -1103,6 +1107,35 @@ int FileWriterAPI_GetTotalFileCount(T_FileWriter *fw)
     }
     closedir(dir);
     return count;
+}
+
+int FileWriterAPI_StatsGet(T_FileWriter *fw, T_FileWriterStats *out)
+{
+    int sb_used;
+    int file_count;
+
+    if(NULL == fw || NULL == out || !fw->init_done)
+    {
+        return -1;
+    }
+
+    /* SB used 和 file_count 不持 file_lock 也能拿：
+     * - SB 内部自持锁；
+     * - GetFileCount 会自行处理并发（自己也拿 file_lock 快照目录路径）。
+     * 先取这两个避免锁嵌套。 */
+    sb_used    = StreamBufferAPI_GetLength(fw->sb);
+    file_count = FileWriterAPI_GetFileCount(fw);
+
+    pthread_mutex_lock(&fw->file_lock);
+    out->bytes_written = fw->stat_bytes_written;
+    out->bytes_lost    = fw->stat_bytes_lost;
+    out->rotate_count  = fw->stat_rotate_count;
+    out->rotate_fail   = fw->stat_rotate_fail;
+    pthread_mutex_unlock(&fw->file_lock);
+
+    out->sb_used    = (sb_used    >= 0) ? sb_used    : 0;
+    out->file_count = (file_count >= 0) ? file_count : 0;
+    return 0;
 }
 
 

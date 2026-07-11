@@ -89,6 +89,25 @@ typedef enum
 } FileWriterType;
 
 
+/**
+ * @struct       T_FileWriterStats
+ * @brief        FileWriter 运行时统计信息
+ * @details      通过 FileWriterAPI_StatsGet 查询。用于生产诊断：
+ *               - bytes_lost > 0 说明磁盘写失败或缓冲溢出，业务方需报警；
+ *               - rotate_fail > 0 说明磁盘/权限问题，轮转未成功；
+ *               - sb_used 高位持续 = 消费线程赶不上生产速度，需调优 flush 参数。
+ */
+typedef struct T_FILEWRITERSTATS
+{
+    unsigned long bytes_written;   /**< 累计写盘成功字节数（fwrite 成功计数） */
+    unsigned long bytes_lost;      /**< 累计丢失字节数（fwrite 短写 / fp==NULL） */
+    unsigned long rotate_count;    /**< 累计成功轮转次数（Init 首个文件不计） */
+    unsigned long rotate_fail;     /**< 累计轮转失败次数（建目录/开新文件失败） */
+    int           sb_used;         /**< 当前 StreamBuffer 中未消费字节数（快照） */
+    int           file_count;      /**< 当前目录下同前缀文件数（快照） */
+} T_FileWriterStats;
+
+
 /* ================================================================== */
 /*                                                                    */
 /*     配置                                                           */
@@ -244,6 +263,10 @@ int FileWriterAPI_WriteBin(T_FileWriter *fw, const void *data, int len);
  * @return       int ret
  * @retval       0:   轮转成功
  * @retval       -1:  参数无效；或 fopen 新文件失败（原文件仍可写）
+ * @warning      **可能阻塞**：本函数需排空 StreamBuffer 剩余数据到当前文件后再切换，
+ *               若 SB 内积压较多（数十 KB）或磁盘 I/O 忙，可能阻塞数十~数百毫秒。
+ *               建议 Rotate 前先 Flush + sleep 一小段让消费线程消化大部分数据，
+ *               降低 Rotate 内 drain 的负担。
  * @author       zlzksrl
  * @date         2026-07-11
  * @Version      V1.0.0
@@ -258,6 +281,10 @@ int FileWriterAPI_Rotate(T_FileWriter *fw);
  * @return       int ret
  * @retval       0:   已触发
  * @retval       -1:  参数无效
+ * @warning      **异步操作**：本函数只唤醒消费线程，不等待写盘完成。
+ *               返回瞬间数据大概率仍在 StreamBuffer 内存中，尚未 fwrite。
+ *               若需"同步落盘"语义，请调用 Flush 后 sleep 数十毫秒，
+ *               或直接调用 Destroy（Destroy 保证全部数据落盘后才返回）。
  * @author       zlzksrl
  * @date         2026-07-11
  * @Version      V1.0.0
@@ -268,6 +295,12 @@ int FileWriterAPI_Flush(T_FileWriter *fw);
 /* ================================================================== */
 /*                                                                    */
 /*     查询                                                           */
+/*                                                                    */
+/*  @note 本节所有查询接口内部会加 file_lock 拷贝快照数据。            */
+/*        消费线程写盘（fwrite/fflush）也持同一把锁，因此在磁盘 I/O   */
+/*        抖动或大批量攒批写盘期间，查询接口可能被短暂阻塞（一般 <10ms，*/
+/*        eMMC 擦除等极端场景可能数十~上百 ms）。查询接口本身不做磁盘 */
+/*        I/O，返回后数据已快照到用户 buffer。                        */
 /*                                                                    */
 /* ================================================================== */
 
@@ -347,6 +380,22 @@ int FileWriterAPI_GetFileCount(T_FileWriter *fw);
  * @Version      V1.0.0
  */
 int FileWriterAPI_GetTotalFileCount(T_FileWriter *fw);
+
+/**
+ * @func         FileWriterAPI_StatsGet
+ * @brief        获取运行时统计信息（用于生产诊断）
+ * @details      拷贝内部累计计数到 out：写盘字节数、丢失字节数、轮转成功/失败次数、
+ *               当前 SB 未消费字节数快照、当前目录同前缀文件数快照。
+ * @param[in]    fw:  句柄
+ * @param[out]   out: 统计信息输出，不能为 NULL
+ * @return       int ret
+ * @retval       0:   获取成功
+ * @retval       -1:  参数无效或未初始化
+ * @author       zlzksrl
+ * @date         2026-07-12
+ * @Version      V1.0.0
+ */
+int FileWriterAPI_StatsGet(T_FileWriter *fw, T_FileWriterStats *out);
 
 
 /* ================================================================== */

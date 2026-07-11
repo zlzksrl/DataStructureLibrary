@@ -408,6 +408,18 @@ static void demo_query(void)
     Debug_printx("prefix count = %d, total count = %d",
                  FileWriterAPI_GetFileCount(fw), FileWriterAPI_GetTotalFileCount(fw));
 
+    /* Stats 快照 */
+    {
+        T_FileWriterStats st;
+        if(0 == FileWriterAPI_StatsGet(fw, &st))
+        {
+            Debug_printx("Stats: written=%lu lost=%lu rotate_ok=%lu rotate_fail=%lu sb_used=%d files=%d",
+                         st.bytes_written, st.bytes_lost,
+                         st.rotate_count, st.rotate_fail,
+                         st.sb_used, st.file_count);
+        }
+    }
+
     FileWriterAPI_Destroy(&fw);
     Debug_printx("Part 6 done");
 }
