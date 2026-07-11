@@ -2,8 +2,18 @@
  * @file        FileWriter.c
  * @brief       LinuxARM-PublicLib-异步文件写入-核心实现文件
  * @details     IMX6ULL平台
- *              基于 StreamBuffer（攒批）+ MemoryPool（格式化buffer）+ ThreadManage（线程）。
+ *              基于 StreamBuffer（攒批）+ MemoryPool（格式化 buffer）+ ThreadManage（消费线程）。
  *              内置消费线程：Wait→GetData→fwrite→fflush，按大小/跨日/手动轮转。
+ *
+ *              线程模型:
+ *              - 生产者(业务线程) 调 Write/WriteBin → vsnprintf → StreamBuffer_PutData
+ *              - 消费者(内置线程) 由 ThreadManage 创建，SCHED_RR + 可配优先级；
+ *                Wait(flush_ms) → GetData → fwrite → fflush → 大小/跨日轮转
+ *              - 关闭: StreamBuffer.Close 阻止写入 → Flush 唤醒 → 消费线程排空 → fclose → 线程退出
+ *
+ *              并发保护:
+ *              - fp / current_* / file_seq / file_written / current_date 由 file_lock 保护
+ *              - StreamBuffer / MemoryPool 各自内部线程安全
  *
  * @author      zlzksrl
  * @Version     V1.0.0
@@ -26,6 +36,7 @@
 /**
  * @func         fw_make_dirs
  * @brief        递归创建多级目录（mkdir -p 语义）
+ * @details      支持绝对路径和相对路径；忽略末尾 /；EEXIST 视为成功。
  */
 static int fw_make_dirs(const char *path)
 {
@@ -33,20 +44,27 @@ static int fw_make_dirs(const char *path)
     size_t len;
     size_t i;
 
-    if(NULL == path) return -1;
+    if(NULL == path || path[0] == '\0') return -1;
 
     strncpy(tmp, path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
     len = strlen(tmp);
     if(len == 0) return -1;
-    if(tmp[len - 1] == '/') tmp[len - 1] = '\0';  /* 去掉末尾 / */
 
+    /* 去掉末尾多余的 / */
+    while(len > 1 && tmp[len - 1] == '/')
+    {
+        tmp[len - 1] = '\0';
+        len--;
+    }
+
+    /* 逐级创建 */
     for(i = 1; i < len; i++)
     {
         if(tmp[i] == '/')
         {
             tmp[i] = '\0';
-            if(mkdir(tmp, 0755) != 0 && errno != EEXIST)
+            if(tmp[0] != '\0' && mkdir(tmp, 0755) != 0 && errno != EEXIST)
             {
                 printf("mkdir [%s] fail: %s ##%s->%d\n", tmp, strerror(errno), __FUNCTION__, __LINE__);
                 return -1;
@@ -69,6 +87,8 @@ static int fw_make_dirs(const char *path)
 static int fw_get_ext_from_type(FileWriterType type, char *out, int out_len)
 {
     const char *ext;
+    if(NULL == out || out_len <= 0) return -1;
+
     switch(type)
     {
         case FILEWRITER_TYPE_LOG: ext = ".log"; break;
@@ -126,11 +146,12 @@ static void fw_get_timestamp_str(char *out, int out_len)
 }
 
 /**
- * @func         fw_date_changed
- * @brief        检查日期是否变化（跨日检测）
- * @return       1=变化, 0=未变化
+ * @func         fw_date_changed_locked
+ * @brief        检查日期是否变化（跨日检测），已变则更新 current_date
+ * @return       1=变化，0=未变化
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_date_changed(T_FileWriter *fw)
+static int fw_date_changed_locked(T_FileWriter *fw)
 {
     char today[FW_DATE_STR_LEN];
     fw_get_date_str(today, sizeof(today));
@@ -144,16 +165,26 @@ static int fw_date_changed(T_FileWriter *fw)
 }
 
 /**
- * @func         fw_build_paths
- * @brief        组装目录路径（不含文件名），并创建目录
+ * @func         fw_build_paths_locked
+ * @brief        组装目录路径（不含文件名），并递归创建目录
+ * @details      路径组成: {dir_path}[/{date_subdir_prefix}{YYYY_MM_DD}][/{file_prefix 路径部分}]
+ *               去掉 dir_path 末尾多余 /，防止 //。
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_build_paths(T_FileWriter *fw)
+static int fw_build_paths_locked(T_FileWriter *fw)
 {
     char full_dir[FW_PATH_MAX];
     int offset = 0;
+    int dir_len;
 
-    /* dir_path */
-    offset += snprintf(full_dir + offset, sizeof(full_dir) - offset, "%s", fw->config.dir_path);
+    if(NULL == fw) return -1;
+
+    /* dir_path（去尾 /） */
+    dir_len = (int)strlen(fw->config.dir_path);
+    while(dir_len > 1 && fw->config.dir_path[dir_len - 1] == '/') dir_len--;
+
+    offset += snprintf(full_dir + offset, sizeof(full_dir) - offset,
+                       "%.*s", dir_len, fw->config.dir_path);
 
     /* 日期子目录 */
     if(fw->config.date_subdir_prefix[0] != '\0')
@@ -162,10 +193,10 @@ static int fw_build_paths(T_FileWriter *fw)
                            fw->config.date_subdir_prefix, fw->current_date);
     }
 
-    /* file_prefix 的路径部分（含 / 的前缀） */
+    /* file_prefix 的路径部分（含 / 时才有子目录） */
     {
         const char *slash = strrchr(fw->config.file_prefix, '/');
-        if(slash != NULL)
+        if(slash != NULL && slash != fw->config.file_prefix)
         {
             int subdir_len = (int)(slash - fw->config.file_prefix);
             offset += snprintf(full_dir + offset, sizeof(full_dir) - offset, "/%.*s",
@@ -173,12 +204,8 @@ static int fw_build_paths(T_FileWriter *fw)
         }
     }
 
-    /* 去掉末尾可能的 // */
-    /* 创建目录 */
-    if(fw_make_dirs(full_dir) != 0)
-    {
-        return -1;
-    }
+    /* 递归创建 */
+    if(fw_make_dirs(full_dir) != 0) return -1;
 
     strncpy(fw->current_dirpath, full_dir, sizeof(fw->current_dirpath) - 1);
     fw->current_dirpath[sizeof(fw->current_dirpath) - 1] = '\0';
@@ -186,40 +213,46 @@ static int fw_build_paths(T_FileWriter *fw)
 }
 
 /**
- * @func         fw_create_file
- * @brief        按命名规则创建新文件
+ * @func         fw_create_file_locked
+ * @brief        按命名规则创建新文件（会先关闭旧文件）
+ * @details      文件名: {prefix_name}{seq3位}_{YYYY-MM-DD-HH-MM-SS}.{ext}
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_create_file(T_FileWriter *fw)
+static int fw_create_file_locked(T_FileWriter *fw)
 {
     char datetime[FW_DATETIME_STR_LEN];
-    const char *prefix_name;  /* file_prefix 的文件名部分 */
+    const char *prefix_name;
     const char *slash;
 
-    /* 找 file_prefix 的文件名部分 */
+    /* file_prefix 的文件名部分 */
     slash = strrchr(fw->config.file_prefix, '/');
     prefix_name = (slash != NULL) ? slash + 1 : fw->config.file_prefix;
 
     /* 日期时间 */
     fw_get_datetime_str(datetime, sizeof(datetime));
 
-    /* 文件名：{prefix_name}{seq3位}_{datetime}.{ext} */
-    snprintf(fw->current_filename, sizeof(fw->current_filename), "%s%03d_%s%s",
-             prefix_name, fw->file_seq, datetime, fw->ext);
+    /* 文件名 */
+    snprintf(fw->current_filename, sizeof(fw->current_filename),
+             "%s_%03d_%s%s", prefix_name, fw->file_seq, datetime, fw->ext);
 
     /* 完整路径 */
-    snprintf(fw->current_filepath, sizeof(fw->current_filepath), "%s/%s",
-             fw->current_dirpath, fw->current_filename);
+    snprintf(fw->current_filepath, sizeof(fw->current_filepath),
+             "%s/%s", fw->current_dirpath, fw->current_filename);
 
-    /* 打开文件 */
+    /* 关闭旧文件 */
     if(fw->fp != NULL)
     {
         fflush(fw->fp);
         fclose(fw->fp);
+        fw->fp = NULL;
     }
+
+    /* 打开新文件（wb 覆盖，同名会截断——因为文件名含时间戳，一般不冲突） */
     fw->fp = fopen(fw->current_filepath, "wb");
     if(fw->fp == NULL)
     {
-        printf("fopen [%s] fail: %s ##%s->%d\n", fw->current_filepath, strerror(errno), __FUNCTION__, __LINE__);
+        printf("fopen [%s] fail: %s ##%s->%d\n",
+               fw->current_filepath, strerror(errno), __FUNCTION__, __LINE__);
         return -1;
     }
 
@@ -228,106 +261,121 @@ static int fw_create_file(T_FileWriter *fw)
 }
 
 /**
- * @func         fw_delete_oldest_if_needed
- * @brief        检查并删除超额的旧文件
+ * @func         fw_delete_oldest_locked
+ * @brief        循环删最老文件，直到数量 <= max_files
+ * @details      匹配当前目录下前缀为 "{prefix_name}_" 的文件；按文件名字典序 = 时间序。
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_delete_oldest_if_needed(T_FileWriter *fw)
+static int fw_delete_oldest_locked(T_FileWriter *fw)
 {
-    DIR *dir;
-    struct dirent *ent;
-    const char *prefix_name;
-    const char *slash;
-    char oldest_name[FW_FILENAME_MAX];
-    char oldest_path[FW_PATH_MAX];
-    time_t oldest_time = 0;
-    int count = 0;
-    int prefix_len;
-
     if(fw->config.max_files <= 0) return 0;
 
-    slash = strrchr(fw->config.file_prefix, '/');
-    prefix_name = (slash != NULL) ? slash + 1 : fw->config.file_prefix;
-    prefix_len = (int)strlen(prefix_name);
-
-    dir = opendir(fw->current_dirpath);
-    if(dir == NULL) return -1;
-
-    oldest_name[0] = '\0';
-    while((ent = readdir(dir)) != NULL)
+    while(1)
     {
-        /* 跳过 . 和 .. */
-        if(strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-        /* 匹配前缀 + "_" */
-        if(strncmp(ent->d_name, prefix_name, prefix_len) == 0 && ent->d_name[prefix_len] == '_')
+        DIR *dir;
+        struct dirent *ent;
+        const char *prefix_name;
+        const char *slash;
+        char oldest_name[FW_FILENAME_MAX];
+        char oldest_path[FW_PATH_MAX];
+        int count = 0;
+        int prefix_len;
+
+        slash = strrchr(fw->config.file_prefix, '/');
+        prefix_name = (slash != NULL) ? slash + 1 : fw->config.file_prefix;
+        prefix_len = (int)strlen(prefix_name);
+
+        dir = opendir(fw->current_dirpath);
+        if(dir == NULL) return -1;
+
+        oldest_name[0] = '\0';
+        while((ent = readdir(dir)) != NULL)
         {
-            count++;
-            /* 用文件名排序找最老（文件名含日期时间，字典序=时间序） */
-            if(oldest_name[0] == '\0' || strcmp(ent->d_name, oldest_name) < 0)
+            if(strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+            /* 匹配 prefix_name + "_" */
+            if(strncmp(ent->d_name, prefix_name, prefix_len) == 0
+               && ent->d_name[prefix_len] == '_')
             {
-                strncpy(oldest_name, ent->d_name, sizeof(oldest_name) - 1);
-                oldest_name[sizeof(oldest_name) - 1] = '\0';
+                count++;
+                if(oldest_name[0] == '\0' || strcmp(ent->d_name, oldest_name) < 0)
+                {
+                    strncpy(oldest_name, ent->d_name, sizeof(oldest_name) - 1);
+                    oldest_name[sizeof(oldest_name) - 1] = '\0';
+                }
             }
         }
-    }
-    closedir(dir);
+        closedir(dir);
 
-    /* 超额则删最老 */
-    if(count > fw->config.max_files && oldest_name[0] != '\0')
-    {
-        snprintf(oldest_path, sizeof(oldest_path), "%s/%s", fw->current_dirpath, oldest_name);
+        /* 未超额则退出 */
+        if(count <= fw->config.max_files || oldest_name[0] == '\0') break;
+
+        /* 不能删当前正在写的文件 */
+        if(strcmp(oldest_name, fw->current_filename) == 0) break;
+
+        snprintf(oldest_path, sizeof(oldest_path), "%s/%s",
+                 fw->current_dirpath, oldest_name);
         if(remove(oldest_path) == 0)
         {
-            printf("FileWriter %s deleted old file: %s ##%s->%d\n",
+            printf("FileWriter [%s] deleted old: %s ##%s->%d\n",
                    fw->name, oldest_name, __FUNCTION__, __LINE__);
+        }
+        else
+        {
+            printf("remove [%s] fail: %s ##%s->%d\n",
+                   oldest_path, strerror(errno), __FUNCTION__, __LINE__);
+            break;
         }
     }
     return 0;
 }
 
 /**
- * @func         fw_rotate_internal
- * @brief        内部轮转：关闭当前文件，建新目录+新文件
+ * @func         fw_rotate_locked
+ * @brief        内部轮转：序号+1，关闭当前文件，建新目录+新文件，删超额旧文件
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_rotate_internal(T_FileWriter *fw)
+static int fw_rotate_locked(T_FileWriter *fw)
 {
-    /* 序号+1 */
     fw->file_seq++;
 
     /* 重新组装路径（日期可能变了） */
-    if(fw_build_paths(fw) != 0) return -1;
+    if(fw_build_paths_locked(fw) != 0) return -1;
 
     /* 创建新文件 */
-    if(fw_create_file(fw) != 0) return -1;
+    if(fw_create_file_locked(fw) != 0) return -1;
 
-    /* 检查并删除超额旧文件 */
-    fw_delete_oldest_if_needed(fw);
+    /* 检查并循环删超额旧文件 */
+    fw_delete_oldest_locked(fw);
 
     return 0;
 }
 
 /**
- * @func         fw_check_file_size_rotate
- * @brief        检查文件大小是否超限，超限则轮转
+ * @func         fw_check_file_size_rotate_locked
+ * @brief        更新已写字节数并按 max_file_size 触发轮转
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_check_file_size_rotate(T_FileWriter *fw, int bytes_written)
+static int fw_check_file_size_rotate_locked(T_FileWriter *fw, int bytes_written)
 {
     fw->file_written += bytes_written;
     if(fw->config.max_file_size > 0 && fw->file_written >= fw->config.max_file_size)
     {
-        return fw_rotate_internal(fw);
+        return fw_rotate_locked(fw);
     }
     return 0;
 }
 
 /**
- * @func         fw_check_daily_rotate
- * @brief        检查跨日，跨日则轮转（建新日期目录+新文件）
+ * @func         fw_check_daily_rotate_locked
+ * @brief        跨日检测：若跨日且开启 auto_rotate_daily 则轮转
+ * @warning      调用前须持有 fw->file_lock
  */
-static int fw_check_daily_rotate(T_FileWriter *fw)
+static int fw_check_daily_rotate_locked(T_FileWriter *fw)
 {
-    if(fw->config.auto_rotate_daily && fw_date_changed(fw))
+    if(fw->config.auto_rotate_daily && fw_date_changed_locked(fw))
     {
-        return fw_rotate_internal(fw);
+        /* 跨日：序号继续递增（文件名含日期，同一日期目录下按 seq 顺序增长） */
+        return fw_rotate_locked(fw);
     }
     return 0;
 }
@@ -337,50 +385,74 @@ static int fw_check_daily_rotate(T_FileWriter *fw)
 
 /**
  * @func         fw_consumer_thread
- * @brief        消费线程：Wait→GetData→fwrite→fflush，处理轮转
+ * @brief        消费线程：Wait→GetData→fwrite→fflush，处理轮转/关闭
+ * @details      循环:
+ *               1. Wait(flush_ms)
+ *               2. 拿锁 → 跨日检查 → 循环 GetData → fwrite → fflush → 大小轮转 → 放锁
+ *               3. 若 Wait 返回 CLOSE_EMPTY，说明关闭且缓冲已空，退出
+ *               4. shutting_down 且 used==0 时兜底退出
  */
 static void *fw_consumer_thread(void *arg)
 {
     T_FileWriter *fw = (T_FileWriter *)arg;
     char buf[FW_FORMAT_BUF_SIZE * 2];
-    int used;
+    int used = 0;
     int r;
+    int n;
 
     while(fw->thread_running)
     {
         r = StreamBufferAPI_Wait(fw->sb, fw->config.flush_ms, &used);
 
-        if(r > 0 || (r == 0 && used > 0))
+        /* 只要 used>0 就取数据（含 Wait 返回 CLOSE_DATA / TRIGGER / TIMEOUT_DATA 的所有情况） */
+        if(used > 0 || r > 0)
         {
-            /* 检查跨日轮转 */
-            fw_check_daily_rotate(fw);
+            pthread_mutex_lock(&fw->file_lock);
+
+            /* 跨日检查（每批开始时检一次；不需要在每条数据前检） */
+            fw_check_daily_rotate_locked(fw);
 
             /* 取数据写盘 */
-            int n;
             while((n = StreamBufferAPI_GetData(fw->sb, buf, sizeof(buf))) > 0)
             {
                 if(fw->fp != NULL)
                 {
                     size_t w = fwrite(buf, 1, (size_t)n, fw->fp);
-                    if(w > 0) fflush(fw->fp);
-                    fw_check_file_size_rotate(fw, (int)w);
+                    if(w > 0)
+                    {
+                        fflush(fw->fp);
+                        fw_check_file_size_rotate_locked(fw, (int)w);
+                    }
+                    else
+                    {
+                        printf("fwrite fail: %s ##%s->%d\n",
+                               strerror(errno), __FUNCTION__, __LINE__);
+                        break;
+                    }
                 }
             }
+
+            pthread_mutex_unlock(&fw->file_lock);
         }
 
-        /* 关闭标志 */
-        if(fw->shutting_down)
+        /* 关闭标志 + 无数据 → 退出 */
+        if(r == STREAMBUFFER_STATUS_CLOSE_EMPTY)
         {
-            /* 排空剩余 */
-            int n;
-            while((n = StreamBufferAPI_GetData(fw->sb, buf, sizeof(buf))) > 0)
-            {
-                if(fw->fp != NULL)
-                {
-                    fwrite(buf, 1, (size_t)n, fw->fp);
-                }
-            }
             break;
+        }
+        if(fw->shutting_down && used == 0)
+        {
+            break;
+        }
+    }
+
+    /* 兜底：最后再排空一次（防 Close 之后 Wait 已退出但仍有残余） */
+    pthread_mutex_lock(&fw->file_lock);
+    while((n = StreamBufferAPI_GetData(fw->sb, buf, sizeof(buf))) > 0)
+    {
+        if(fw->fp != NULL)
+        {
+            fwrite(buf, 1, (size_t)n, fw->fp);
         }
     }
 
@@ -391,6 +463,7 @@ static void *fw_consumer_thread(void *arg)
         fclose(fw->fp);
         fw->fp = NULL;
     }
+    pthread_mutex_unlock(&fw->file_lock);
 
     return NULL;
 }
@@ -405,11 +478,18 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     T_FileWriter *pt;
     T_StreamBufferConfig sb_cfg;
     T_MemPoolConfig mp_cfg;
-    pthread_condattr_t attr;
+    T_ThreadCreateConfig th_cfg;
+    int prio;
+    int rc;
 
-    if(NULL == pp) { printf("NULL == pp ##%s->%d\n", __FUNCTION__, __LINE__); return -1; }
-    if(NULL != *pp) { printf("NULL != *pp fail ##%s->%d\n", __FUNCTION__, __LINE__); return -1; }
+    if(NULL == pp)  { printf("NULL == pp ##%s->%d\n",  __FUNCTION__, __LINE__); return -1; }
+    if(NULL != *pp) { printf("NULL != *pp ##%s->%d\n", __FUNCTION__, __LINE__); return -1; }
     if(NULL == cfg) { printf("NULL == cfg ##%s->%d\n", __FUNCTION__, __LINE__); return -1; }
+    if(cfg->dir_path[0] == '\0' || cfg->file_prefix[0] == '\0')
+    {
+        printf("dir_path/file_prefix empty ##%s->%d\n", __FUNCTION__, __LINE__);
+        return -1;
+    }
 
     printf("FileWriterLibVision = [%s]\n", FileWriter_PROJECT_MAKETIME);
 
@@ -417,8 +497,16 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     if(NULL == pt) { printf("malloc fail ##%s->%d\n", __FUNCTION__, __LINE__); return -1; }
     memset(pt, 0, sizeof(T_FileWriter));
 
-    /* ★ memcpy 配置（防篡改） */
+    /* 拷贝配置 */
     memcpy(&pt->config, cfg, sizeof(T_FileWriterConfig));
+
+    /* 实例名（借 file_prefix 的文件名部分） */
+    {
+        const char *slash = strrchr(cfg->file_prefix, '/');
+        const char *nm    = (slash != NULL) ? slash + 1 : cfg->file_prefix;
+        strncpy(pt->name, nm, MAX_FILEWRITERNAME_LEN);
+        pt->name[MAX_FILEWRITERNAME_LEN] = '\0';
+    }
 
     /* 扩展名：file_ext 非空用 file_ext，否则按 file_type 选 */
     if(pt->config.file_ext[0] != '\0')
@@ -431,63 +519,108 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
         fw_get_ext_from_type(pt->config.file_type, pt->ext, sizeof(pt->ext));
     }
 
-    /* 初始日期 */
+    /* file_lock */
+    if(pthread_mutex_init(&pt->file_lock, NULL) != 0)
+    {
+        printf("mutex_init fail ##%s->%d\n", __FUNCTION__, __LINE__);
+        free(pt);
+        return -1;
+    }
+
+    /* 初始日期 & 序号 */
     fw_get_date_str(pt->current_date, sizeof(pt->current_date));
     pt->file_seq = 0;
 
-    /* 组装目录路径 + 创建目录 */
-    if(fw_build_paths(pt) != 0)
-    {
-        free(pt);
-        return -1;
-    }
-
-    /* 创建第一个文件 */
-    if(fw_create_file(pt) != 0)
-    {
-        free(pt);
-        return -1;
-    }
-
-    /* 初始化 MemoryPool（格式化 buffer） */
+    /* 先初始化 MemoryPool（避免 fopen 后失败留空文件） */
+    memset(&mp_cfg, 0, sizeof(mp_cfg));
     mp_cfg.element_size = FW_FORMAT_BUF_SIZE;
-    mp_cfg.init_count = FW_FORMAT_POOL_COUNT;
-    mp_cfg.mode = MEMPOOL_MODE_DROP;
-    mp_cfg.grow_count = 0;
-    mp_cfg.block_timeo = 0;
+    mp_cfg.init_count   = FW_FORMAT_POOL_COUNT;
+    mp_cfg.mode         = MEMPOOL_MODE_DROP;
+    mp_cfg.grow_count   = 0;
+    mp_cfg.block_timeo  = 0;
     if(MemPoolAPI_Init(&pt->pool, &mp_cfg, "fw_pool") != 0)
     {
         printf("MemPool init fail ##%s->%d\n", __FUNCTION__, __LINE__);
-        fclose(pt->fp);
+        pthread_mutex_destroy(&pt->file_lock);
         free(pt);
         return -1;
     }
 
-    /* 初始化 StreamBuffer */
-    sb_cfg.iCapacity = (pt->config.buffer_capacity > 0) ? pt->config.buffer_capacity : 65536;
-    sb_cfg.iFlushBytes = (pt->config.flush_bytes > 0) ? pt->config.flush_bytes : 4096;
-    sb_cfg.iFlushMs = 0;  /* 消费线程自己用 Wait(flush_ms) */
+    /* StreamBuffer */
+    memset(&sb_cfg, 0, sizeof(sb_cfg));
+    sb_cfg.iCapacity   = (pt->config.buffer_capacity > 0) ? pt->config.buffer_capacity : FW_DEFAULT_BUFFER_CAPACITY;
+    sb_cfg.iFlushBytes = (pt->config.flush_bytes     > 0) ? pt->config.flush_bytes     : FW_DEFAULT_FLUSH_BYTES;
     if(StreamBufferAPI_Init(&pt->sb, &sb_cfg, "fw_sb") != 0)
     {
         printf("StreamBuffer init fail ##%s->%d\n", __FUNCTION__, __LINE__);
         MemPoolAPI_Destroy(&pt->pool);
-        fclose(pt->fp);
+        pthread_mutex_destroy(&pt->file_lock);
         free(pt);
         return -1;
     }
 
-    /* 启动消费线程 */
-    pt->thread_running = 1;
-    pt->shutting_down = 0;
-    if(pthread_create(&pt->thread_id, NULL, fw_consumer_thread, pt) != 0)
+    /* flush_ms 未配置则用默认 */
+    if(pt->config.flush_ms <= 0) pt->config.flush_ms = FW_DEFAULT_FLUSH_MS;
+
+    /* 组装目录 + 创建第一个文件（拿锁只是为了函数约定，此时其它线程尚未启动） */
+    pthread_mutex_lock(&pt->file_lock);
+    rc = fw_build_paths_locked(pt);
+    if(rc == 0) rc = fw_create_file_locked(pt);
+    pthread_mutex_unlock(&pt->file_lock);
+    if(rc != 0)
     {
-        printf("pthread_create fail ##%s->%d\n", __FUNCTION__, __LINE__);
         StreamBufferAPI_Destroy(&pt->sb);
         MemPoolAPI_Destroy(&pt->pool);
-        fclose(pt->fp);
+        pthread_mutex_destroy(&pt->file_lock);
         free(pt);
         return -1;
     }
+
+    /* 启动消费线程（用 ThreadManage：SCHED_RR + 可配优先级） */
+    prio = (pt->config.thread_priority > 0 && pt->config.thread_priority <= 99)
+           ? pt->config.thread_priority : FW_DEFAULT_THREAD_PRIORITY;
+
+    memset(&th_cfg, 0, sizeof(th_cfg));
+    th_cfg.pThreadFunc        = fw_consumer_thread;
+    th_cfg.pThreadFuncUserArg = pt;
+    th_cfg.sThreadName        = pt->name;
+    th_cfg.eSetAttr           = 2;                         /* 配置全部属性 */
+    th_cfg.istacksize_MB      = 1;
+    th_cfg.eDetachState       = PTHREAD_CREATE_JOINABLE;
+    th_cfg.einheritsched      = PTHREAD_EXPLICIT_SCHED;    /* 显式使用下面的策略/优先级 */
+    th_cfg.eSchedPolicy       = SCHED_RR;                  /* 需求 D2：SCHED_RR 轮转 */
+    th_cfg.iSchedPriority     = prio;
+
+    pt->thread_running = 1;
+    pt->shutting_down  = 0;
+
+    if(ThreadAPI_ThreadCreate(&th_cfg) < 0)
+    {
+        /* 优先级不足时退化为默认策略（非 root 时 SCHED_RR 常需权限） */
+        printf("ThreadCreate(SCHED_RR pri=%d) fail, fallback to default ##%s->%d\n",
+               prio, __FUNCTION__, __LINE__);
+        memset(&th_cfg, 0, sizeof(th_cfg));
+        th_cfg.pThreadFunc        = fw_consumer_thread;
+        th_cfg.pThreadFuncUserArg = pt;
+        th_cfg.sThreadName        = pt->name;
+        th_cfg.eSetAttr           = 0;                     /* 默认属性 */
+        th_cfg.eDetachState       = PTHREAD_CREATE_JOINABLE;
+
+        if(ThreadAPI_ThreadCreate(&th_cfg) < 0)
+        {
+            printf("ThreadCreate fail ##%s->%d\n", __FUNCTION__, __LINE__);
+            pt->thread_running = 0;
+            pthread_mutex_lock(&pt->file_lock);
+            if(pt->fp != NULL) { fclose(pt->fp); pt->fp = NULL; }
+            pthread_mutex_unlock(&pt->file_lock);
+            StreamBufferAPI_Destroy(&pt->sb);
+            MemPoolAPI_Destroy(&pt->pool);
+            pthread_mutex_destroy(&pt->file_lock);
+            free(pt);
+            return -1;
+        }
+    }
+    pt->thread_id = th_cfg.tThreadPid;
 
     pt->init_done = 1;
     *pp = pt;
@@ -506,20 +639,30 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
     /* 1. 阻止新写入 */
     StreamBufferAPI_Close(pt->sb);
 
-    /* 2. 通知消费线程排空后退出 */
-    pt->shutting_down = 1;
-    StreamBufferAPI_Flush(pt->sb);  /* 唤醒线程 */
+    /* 2. 通知消费线程排空后退出（thread_running 只是软标志，实际靠 CLOSE_EMPTY） */
+    pt->shutting_down  = 1;
+    pt->thread_running = 0;
+    StreamBufferAPI_Flush(pt->sb);  /* 唤醒 Wait */
 
-    /* 3. 等线程退出（排空+fclose 在线程内完成） */
+    /* 3. 等线程退出（排空 + fclose 在线程内完成） */
     pthread_join(pt->thread_id, NULL);
 
-    /* 4. 销毁 StreamBuffer + MemoryPool */
+    /* 4. 兜底：线程内已 fclose，这里再检查一次 */
+    pthread_mutex_lock(&pt->file_lock);
+    if(pt->fp != NULL)
+    {
+        fflush(pt->fp);
+        fclose(pt->fp);
+        pt->fp = NULL;
+    }
+    pthread_mutex_unlock(&pt->file_lock);
+
+    /* 5. 销毁 StreamBuffer + MemoryPool */
     StreamBufferAPI_Destroy(&pt->sb);
     MemPoolAPI_Destroy(&pt->pool);
 
-    /* 5. 安全：文件已在线程内关闭，这里兜底 */
-    if(pt->fp != NULL) fclose(pt->fp);
-
+    /* 6. 销毁锁、释放结构体 */
+    pthread_mutex_destroy(&pt->file_lock);
     pt->init_done = 0;
     free(pt);
     *pp = NULL;
@@ -534,18 +677,25 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
     char *buf;
     int offset = 0;
     int fmt_len;
+    int ret;
     va_list ap;
 
     if(NULL == fw || NULL == fmt || !fw->init_done) return -1;
 
-    /* 从 MemoryPool 取 buffer */
+    /* 从 MemoryPool 取 buffer；池满则用栈兜底 */
     buf = (char *)MemPoolAPI_Alloc(fw->pool);
     if(buf == NULL)
     {
-        /* 池满，用栈兜底 */
         char stack_buf[FW_FORMAT_BUF_SIZE];
+        int off = 0;
+
+        if(fw->config.timestamp)
+        {
+            fw_get_timestamp_str(stack_buf, FW_TIMESTAMP_STR_LEN);
+            off = (int)strlen(stack_buf);
+        }
         va_start(ap, fmt);
-        vsnprintf(stack_buf, sizeof(stack_buf), fmt, ap);
+        vsnprintf(stack_buf + off, sizeof(stack_buf) - off, fmt, ap);
         va_end(ap);
         return StreamBufferAPI_PutData(fw->sb, stack_buf, (int)strlen(stack_buf));
     }
@@ -564,12 +714,12 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
 
     fmt_len = (int)strlen(buf);
 
-    /* 入队 StreamBuffer */
-    {
-        int ret = StreamBufferAPI_PutData(fw->sb, buf, fmt_len);
-        MemPoolAPI_Free(fw->pool, buf);
-        return ret;
-    }
+    /* 入队 */
+    ret = StreamBufferAPI_PutData(fw->sb, buf, fmt_len);
+
+    /* 归还 buffer */
+    MemPoolAPI_Free(fw->pool, buf);
+    return ret;
 }
 
 int FileWriterAPI_WriteBin(T_FileWriter *fw, const void *data, int len)
@@ -584,8 +734,14 @@ int FileWriterAPI_WriteBin(T_FileWriter *fw, const void *data, int len)
 
 int FileWriterAPI_Rotate(T_FileWriter *fw)
 {
+    int ret;
     if(NULL == fw || !fw->init_done) return -1;
-    return fw_rotate_internal(fw);
+
+    /* Rotate 需要与消费线程互斥（消费线程写盘可能同时进行） */
+    pthread_mutex_lock(&fw->file_lock);
+    ret = fw_rotate_locked(fw);
+    pthread_mutex_unlock(&fw->file_lock);
+    return ret;
 }
 
 int FileWriterAPI_Flush(T_FileWriter *fw)
@@ -599,25 +755,31 @@ int FileWriterAPI_Flush(T_FileWriter *fw)
 
 int FileWriterAPI_GetCurrentFileName(T_FileWriter *fw, char *out, int out_len)
 {
-    if(NULL == fw || NULL == out || !fw->init_done) return -1;
+    if(NULL == fw || NULL == out || out_len <= 0 || !fw->init_done) return -1;
+    pthread_mutex_lock(&fw->file_lock);
     strncpy(out, fw->current_filename, out_len - 1);
     out[out_len - 1] = '\0';
+    pthread_mutex_unlock(&fw->file_lock);
     return 0;
 }
 
 int FileWriterAPI_GetCurrentFilePath(T_FileWriter *fw, char *out, int out_len)
 {
-    if(NULL == fw || NULL == out || !fw->init_done) return -1;
+    if(NULL == fw || NULL == out || out_len <= 0 || !fw->init_done) return -1;
+    pthread_mutex_lock(&fw->file_lock);
     strncpy(out, fw->current_filepath, out_len - 1);
     out[out_len - 1] = '\0';
+    pthread_mutex_unlock(&fw->file_lock);
     return 0;
 }
 
 int FileWriterAPI_GetCurrentDirPath(T_FileWriter *fw, char *out, int out_len)
 {
-    if(NULL == fw || NULL == out || !fw->init_done) return -1;
+    if(NULL == fw || NULL == out || out_len <= 0 || !fw->init_done) return -1;
+    pthread_mutex_lock(&fw->file_lock);
     strncpy(out, fw->current_dirpath, out_len - 1);
     out[out_len - 1] = '\0';
+    pthread_mutex_unlock(&fw->file_lock);
     return 0;
 }
 
@@ -627,22 +789,30 @@ int FileWriterAPI_GetFileCount(T_FileWriter *fw)
     struct dirent *ent;
     const char *prefix_name;
     const char *slash;
+    char dirpath[FW_PATH_MAX];
     int count = 0;
     int prefix_len;
 
     if(NULL == fw || !fw->init_done) return -1;
 
+    /* 快照当前目录 */
+    pthread_mutex_lock(&fw->file_lock);
+    strncpy(dirpath, fw->current_dirpath, sizeof(dirpath) - 1);
+    dirpath[sizeof(dirpath) - 1] = '\0';
+    pthread_mutex_unlock(&fw->file_lock);
+
     slash = strrchr(fw->config.file_prefix, '/');
     prefix_name = (slash != NULL) ? slash + 1 : fw->config.file_prefix;
     prefix_len = (int)strlen(prefix_name);
 
-    dir = opendir(fw->current_dirpath);
+    dir = opendir(dirpath);
     if(dir == NULL) return -1;
 
     while((ent = readdir(dir)) != NULL)
     {
         if(strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-        if(strncmp(ent->d_name, prefix_name, prefix_len) == 0 && ent->d_name[prefix_len] == '_')
+        if(strncmp(ent->d_name, prefix_name, prefix_len) == 0
+           && ent->d_name[prefix_len] == '_')
             count++;
     }
     closedir(dir);
@@ -653,11 +823,17 @@ int FileWriterAPI_GetTotalFileCount(T_FileWriter *fw)
 {
     DIR *dir;
     struct dirent *ent;
+    char dirpath[FW_PATH_MAX];
     int count = 0;
 
     if(NULL == fw || !fw->init_done) return -1;
 
-    dir = opendir(fw->current_dirpath);
+    pthread_mutex_lock(&fw->file_lock);
+    strncpy(dirpath, fw->current_dirpath, sizeof(dirpath) - 1);
+    dirpath[sizeof(dirpath) - 1] = '\0';
+    pthread_mutex_unlock(&fw->file_lock);
+
+    dir = opendir(dirpath);
     if(dir == NULL) return -1;
 
     while((ent = readdir(dir)) != NULL)
@@ -674,7 +850,7 @@ int FileWriterAPI_GetTotalFileCount(T_FileWriter *fw)
 
 int FileWriterAPI_GetTimeString(char *out, int out_len, const char *fmt)
 {
-    if(NULL == out || NULL == fmt) return -1;
+    if(NULL == out || out_len <= 0 || NULL == fmt) return -1;
 
     if(strcmp(fmt, "datetime") == 0)
     {
@@ -700,7 +876,7 @@ int FileWriterAPI_GetTimeString(char *out, int out_len, const char *fmt)
     }
     else
     {
-        return -1;  /* 未知格式 */
+        return -1;
     }
     return 0;
 }
