@@ -41,15 +41,15 @@
 /* ========================== 测试根目录 ========================== */
 /* 现场跑起来会在此目录下创建结构：
  *   ./fw_test/
- *     ├── X2026_07_11/                (Part 1 log)
+ *     ├── log/X2026_07_11/                  (Part 1 log)
  *     │   └── demo_log_000_...log
- *     ├── X2026_07_11/                (Part 2 csv)
- *     │   └── sensor/sensor1_000_...csv
- *     ├── bin/                        (Part 3 bin, 无日期子目录)
+ *     ├── log/X2026_07_11/sensor/           (Part 2 csv)
+ *     │   └── sensor1_000_...csv
+ *     ├── bin/                              (Part 3 bin, 无日期子目录)
  *     │   └── frame_000_...bin
- *     └── multi/                      (Part 4 多实例)
- *         ├── X2026_07_11/inst_a_000_...log
- *         └── X2026_07_11/inst_b_000_...log
+ *     └── multi/X2026_07_11/                (Part 4 多实例)
+ *         ├── inst_a_000_...log
+ *         └── inst_b_000_...log
  */
 #define TEST_ROOT   "./fw_test"
 
@@ -189,7 +189,8 @@ static void demo_bin(void)
     T_FileWriter *fw = NULL;
     T_FileWriterConfig cfg;
     Frame frame;
-    int i, k;
+    int i;
+    int k;
 
     Debug_printx("======== Part 3: BIN ========");
 
@@ -219,7 +220,9 @@ static void demo_bin(void)
         frame.magic = 0xDEADBEEF;
         frame.seq   = (unsigned int)i;
         for(k = 0; k < (int)sizeof(frame.payload); k++)
+        {
             frame.payload[k] = (unsigned char)((i + k) & 0xFF);
+        }
 
         FileWriterAPI_WriteBin(fw, &frame, (int)sizeof(frame));
         usleep(5 * 1000);
@@ -262,7 +265,11 @@ static void demo_multi_instance(void)
     cfg.flush_bytes     = 256;
     cfg.flush_ms        = 100;
     cfg.buffer_capacity = 16384;
-    if(FileWriterAPI_Init(&fw_a, &cfg) != 0) { Debug_printx("inst_a init fail"); return; }
+    if(FileWriterAPI_Init(&fw_a, &cfg) != 0)
+    {
+        Debug_printx("inst_a init fail");
+        return;
+    }
 
     /* 实例 B（不同前缀、不同优先级） */
     memset(&cfg, 0, sizeof(cfg));
@@ -310,7 +317,8 @@ static void demo_rotate(void)
 {
     T_FileWriter *fw = NULL;
     T_FileWriterConfig cfg;
-    int i, r;
+    int i;
+    int r;
     char name[128];
 
     Debug_printx("======== Part 5: ROTATE ========");
@@ -326,7 +334,11 @@ static void demo_rotate(void)
     cfg.flush_bytes     = 128;
     cfg.flush_ms        = 100;
     cfg.buffer_capacity = 8192;
-    if(FileWriterAPI_Init(&fw, &cfg) != 0) { Debug_printx("Init fail"); return; }
+    if(FileWriterAPI_Init(&fw, &cfg) != 0)
+    {
+        Debug_printx("Init fail");
+        return;
+    }
 
     /* 写 → 手动 Rotate 6 次，观察 max_files=3 是否生效 */
     for(i = 0; i < 6; i++)
@@ -377,15 +389,22 @@ static void demo_query(void)
     cfg.flush_bytes     = 128;
     cfg.flush_ms        = 100;
     cfg.buffer_capacity = 8192;
-    if(FileWriterAPI_Init(&fw, &cfg) != 0) { Debug_printx("Init fail"); return; }
+    if(FileWriterAPI_Init(&fw, &cfg) != 0)
+    {
+        Debug_printx("Init fail");
+        return;
+    }
 
     FileWriterAPI_Write(fw, "query test\n");
     FileWriterAPI_Flush(fw);
     usleep(150 * 1000);
 
-    FileWriterAPI_GetCurrentFileName(fw, buf, sizeof(buf));  Debug_printx("FileName  = [%s]", buf);
-    FileWriterAPI_GetCurrentFilePath(fw, buf, sizeof(buf));  Debug_printx("FilePath  = [%s]", buf);
-    FileWriterAPI_GetCurrentDirPath (fw, buf, sizeof(buf));  Debug_printx("DirPath   = [%s]", buf);
+    FileWriterAPI_GetCurrentFileName(fw, buf, sizeof(buf));
+    Debug_printx("FileName  = [%s]", buf);
+    FileWriterAPI_GetCurrentFilePath(fw, buf, sizeof(buf));
+    Debug_printx("FilePath  = [%s]", buf);
+    FileWriterAPI_GetCurrentDirPath (fw, buf, sizeof(buf));
+    Debug_printx("DirPath   = [%s]", buf);
     Debug_printx("prefix count = %d, total count = %d",
                  FileWriterAPI_GetFileCount(fw), FileWriterAPI_GetTotalFileCount(fw));
 
@@ -406,10 +425,14 @@ static void demo_utils(void)
 
     Debug_printx("======== Part 7: UTILS ========");
 
-    FileWriterAPI_GetTimeString(buf, sizeof(buf), "datetime");    Debug_printx("datetime    = [%s]", buf);
-    FileWriterAPI_GetTimeString(buf, sizeof(buf), "date");        Debug_printx("date        = [%s]", buf);
-    FileWriterAPI_GetTimeString(buf, sizeof(buf), "log");         Debug_printx("log         = [%s]", buf);
-    FileWriterAPI_GetTimeString(buf, sizeof(buf), "datetime_ms"); Debug_printx("datetime_ms = [%s]", buf);
+    FileWriterAPI_GetTimeString(buf, sizeof(buf), "datetime");
+    Debug_printx("datetime    = [%s]", buf);
+    FileWriterAPI_GetTimeString(buf, sizeof(buf), "date");
+    Debug_printx("date        = [%s]", buf);
+    FileWriterAPI_GetTimeString(buf, sizeof(buf), "log");
+    Debug_printx("log         = [%s]", buf);
+    FileWriterAPI_GetTimeString(buf, sizeof(buf), "datetime_ms");
+    Debug_printx("datetime_ms = [%s]", buf);
 
     FileWriterAPI_MakeDirs(TEST_ROOT "/utils/a/b/c");
     Debug_printx("MakeDirs [%s/utils/a/b/c] done", TEST_ROOT);

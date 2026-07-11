@@ -86,7 +86,7 @@ struct T_FILEWRITER
     int                 file_seq;                          /**< 当前文件序号 */
     long                file_written;                      /**< 当前文件已写字节数（用于 max_file_size 轮转判断） */
     char                current_date[FW_DATE_STR_LEN];     /**< 当前日期 "2026_07_11"（跨日检测用） */
-    pthread_mutex_t     file_lock;                         /**< 保护 fp / current_* / file_seq / file_written / current_date */
+    pthread_mutex_t     file_lock;                         /**< 保护 fp / current_* / file_seq / file_written / current_date / stats */
 
     /* ---- 依赖库句柄 ---- */
     T_StreamBuffer     *sb;                                /**< StreamBuffer 攒批缓冲 */
@@ -94,39 +94,19 @@ struct T_FILEWRITER
 
     /* ---- 消费线程 ---- */
     pthread_t           thread_id;                         /**< 消费线程 ID（ThreadManage 创建） */
-    int                 thread_running;                    /**< 线程运行标志 0/1 */
-    int                 shutting_down;                     /**< 关闭标志（Destroy 时置 1，通知线程退出） */
+    volatile int        thread_running;                    /**< 线程运行标志 0/1（跨线程访问，volatile） */
+    volatile int        shutting_down;                     /**< 关闭标志（Destroy 时置 1，通知线程退出） */
+
+    /* ---- 统计信息（受 file_lock 保护） ---- */
+    unsigned long       stat_bytes_written;                /**< 累计已写盘字节数（fwrite 成功计数） */
+    unsigned long       stat_bytes_lost;                   /**< 累计 fwrite 失败丢失字节数 */
+    unsigned long       stat_rotate_count;                 /**< 累计成功轮转次数 */
+    unsigned long       stat_rotate_fail;                  /**< 累计轮转失败次数 */
 
     /* ---- 状态 ---- */
     int                 init_done;                         /**< 初始化完成标志 */
     char                name[MAX_FILEWRITERNAME_LEN + 1];  /**< 实例名称 */
 };
-
-
-/* ================================================================== */
-/*                                                                    */
-/*     内部函数声明                                                   */
-/*                                                                    */
-/* ================================================================== */
-
-/* ---- 路径与文件管理 ---- */
-static int  fw_make_dirs(const char *path);
-static int  fw_build_paths_locked(T_FileWriter *fw);
-static int  fw_create_file_locked(T_FileWriter *fw);
-static int  fw_rotate_locked(T_FileWriter *fw);
-static int  fw_check_file_size_rotate_locked(T_FileWriter *fw, int bytes_written);
-static int  fw_check_daily_rotate_locked(T_FileWriter *fw);
-static int  fw_delete_oldest_locked(T_FileWriter *fw);
-static int  fw_get_ext_from_type(FileWriterType type, char *out, int out_len);
-
-/* ---- 时间工具 ---- */
-static void fw_get_date_str(char *out, int out_len);
-static void fw_get_datetime_str(char *out, int out_len);
-static void fw_get_timestamp_str(char *out, int out_len);
-static int  fw_date_changed_locked(T_FileWriter *fw);
-
-/* ---- 消费线程 ---- */
-static void *fw_consumer_thread(void *arg);
 
 
 #ifdef __cplusplus

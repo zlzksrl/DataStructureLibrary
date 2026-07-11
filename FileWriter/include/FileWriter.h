@@ -171,6 +171,8 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg);
  * @return       int ret
  * @retval       0:   销毁成功（数据完整落盘）
  * @retval       -1:  参数无效或 *pp 已为 NULL
+ * @warning      调用前必须确保所有业务线程已停止调用 Write/WriteBin/Flush/Rotate/查询接口，
+ *               本函数与写入/查询并发不安全（由调用者负责生命周期同步）。
  * @author       zlzksrl
  * @date         2026-07-11
  * @Version      V1.0.0
@@ -198,6 +200,7 @@ int FileWriterAPI_Destroy(T_FileWriter **pp);
  * @retval       >=0: 入队字节数
  * @retval       -1:  参数无效或未初始化
  * @retval       -2:  已关闭，不再接收写入
+ * @retval       -3:  StreamBuffer 缓冲空间不足，本段被丢弃（满则丢新）
  * @author       zlzksrl
  * @date         2026-07-11
  * @Version      V1.0.0
@@ -215,6 +218,7 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...);
  * @retval       >=0: 入队字节数
  * @retval       -1:  参数无效或未初始化
  * @retval       -2:  已关闭
+ * @retval       -3:  StreamBuffer 缓冲空间不足，本段被丢弃（满则丢新）
  * @author       zlzksrl
  * @date         2026-07-11
  * @Version      V1.0.0
@@ -231,12 +235,16 @@ int FileWriterAPI_WriteBin(T_FileWriter *fw, const void *data, int len);
 /**
  * @func         FileWriterAPI_Rotate
  * @brief        FileWriterAPI-手动轮转（创建新文件，关闭当前文件）
- * @details      fflush + fclose 当前文件，序号+1，按命名规则创建新文件。
- *               若 max_files > 0 则检查并删除超额的旧文件。
+ * @details      内部动作（原子完成，与消费线程互斥）：
+ *               1. 排空 StreamBuffer 剩余数据到当前文件（避免跨文件错位）；
+ *               2. fopen 新文件（成功后再 fclose 旧文件，失败保持旧文件可写）；
+ *               3. 序号 +1；
+ *               4. 若 max_files > 0 则删除超额的旧文件。
+ *               失败时保持原状态：仍写入原文件，file_seq 不变。
  * @param[in]    fw: 句柄
  * @return       int ret
  * @retval       0:   轮转成功
- * @retval       -1:  参数无效或文件创建失败
+ * @retval       -1:  参数无效；或 fopen 新文件失败（原文件仍可写）
  * @author       zlzksrl
  * @date         2026-07-11
  * @Version      V1.0.0
