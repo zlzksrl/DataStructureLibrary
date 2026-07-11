@@ -12,7 +12,7 @@ TARGET_Name        = RedBlackTree
 ProgramVER         = 1.0.0
 USERNAME           = zlzksrl
 # 公共库安装路径（RedBlackTree 依赖 KernelLinkedList 的 container_of 宏）
-LIBFILE_PATH       = ~/zlzksrl/LinuxARM/PublicLibrary/LinuxARM_IMX6ULL
+LIBFILE_PATH       = ~/zlzksrl/LinuxARM/Program/DataStructureLibrary/Library/
 
 # ==============================================================================
 # 安装路径
@@ -161,8 +161,9 @@ install_lib:slib dlib
 	rm $(INSTALL_PATH) -rf
 	mkdir -p $(INSTALL_PATH)
 	mkdir -p $(INSTALL_PATH)include/
-	mkdir -p $(INSTALL_PATH)lib/
-	cp $(STATIC_LIBNAME) $(INSTALL_PATH)lib/
-	cp $(SHARED_LIBNAME) $(INSTALL_PATH)lib/
+	mkdir -p $(INSTALL_PATH)StaticLib/
+	mkdir -p $(INSTALL_PATH)SharedLib/
+	cp $(STATIC_LIBNAME) $(INSTALL_PATH)StaticLib/
+	cp $(SHARED_LIBNAME) $(INSTALL_PATH)SharedLib/
 	cp ../include/* $(INSTALL_PATH)include/
 	cp $(PROJECT_INFO) $(INSTALL_PATH)

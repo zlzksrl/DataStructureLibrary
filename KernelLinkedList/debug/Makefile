@@ -5,7 +5,7 @@ CC = arm-linux-gnueabihf-gcc
 TARGET_Name        = KernelLinkedList
 ProgramVER         = 1.0.0
 USERNAME           = zlzksrl
-LIBFILE_PATH       = ~/zlzksrl/LinuxARM/PublicLibrary/LinuxARM_IMX6ULL
+LIBFILE_PATH       = ~/zlzksrl/LinuxARM/Program/DataStructureLibrary/Library/
 
 # 安装路径
 INSTALL_PATH       = $(LIBFILE_PATH)/$(TARGET_Name)/
