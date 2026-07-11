@@ -3,10 +3,9 @@
  * @brief       LinuxARM-PublicLib-异步文件写入模块-公共API头文件
  * @details     IMX6ULL平台
  *              本文件提供 FileWriter 异步文件写入模块的公共API。
- *              FileWriter 基于 StreamBuffer（攒批缓冲）+ MemoryPool（格式化buffer池）
- *              + ThreadManage（消费线程管理），提供 printf 式格式化写入接口，
- *              攒批写盘（减磁盘磨损），支持日志/CSV/二进制，自动文件轮转
- *              （按数量+大小+日期），优雅关闭。
+ *              FileWriter 基于 StreamBuffer（攒批缓冲）+ ThreadManage（消费线程管理），
+ *              提供 printf 式格式化写入接口，攒批写盘（减磁盘磨损），支持日志/CSV/二进制，
+ *              自动文件轮转（按数量+大小+日期），优雅关闭。
  *
  *              核心特性:
  *              - 异步写入:          业务线程 Write→StreamBuffer 入队，内置消费线程批量 fwrite
@@ -141,7 +140,7 @@ typedef struct T_FILEWRITERCONFIG
 /**
  * @func         FileWriterAPI_Init
  * @brief        FileWriterAPI-初始化异步文件写入实例
- * @details      创建目录/文件，初始化 MemoryPool + StreamBuffer，
+ * @details      创建目录/文件，初始化 StreamBuffer，
  *               用 ThreadManage 创建消费线程（SCHED_RR + 配置优先级）。
  *               可重入：多次 Init 创建独立实例。
  * @param[in]    pp:  句柄二级指针，调用前 *pp 必须为 NULL
@@ -164,7 +163,7 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg);
  *               2. 消费线程排空缓冲（全部 fwrite 落盘）
  *               3. fflush + fclose 文件
  *               4. 线程退出（ThreadManage）
- *               5. Destroy StreamBuffer + MemoryPool
+ *               5. Destroy StreamBuffer
  *               6. free 结构体，*pp = NULL
  *               返回后保证文件数据完整，所有资源释放。
  * @param[in]    pp: 句柄二级指针
@@ -189,10 +188,10 @@ int FileWriterAPI_Destroy(T_FileWriter **pp);
 /**
  * @func         FileWriterAPI_Write
  * @brief        FileWriterAPI-格式化写入（printf 式）
- * @details      内部 vsnprintf 格式化到 MemoryPool 分配的 buffer，
+ * @details      内部 vsnprintf 格式化到栈 buffer（FW_FORMAT_BUF_SIZE 字节，1KB），
  *               [可选] 前置时间戳 [HH:MM:SS.mmmmmm]，
  *               然后 StreamBuffer.PutData 入队（满则丢新，不阻塞业务）。
- *               Write 返回前归还 buffer 到 MemoryPool。
+ *               超长内容会被截断到 buffer 末尾，不越界。
  * @param[in]    fw:  句柄
  * @param[in]    fmt: 格式串（同 printf）
  * @param[in]    ...: 可变参数

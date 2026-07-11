@@ -42,14 +42,12 @@
 
 /* 依赖库头 */
 #include <StreamBuffer.h>
-#include <MemoryPool.h>
 #include <ThreadManage.h>
 
 /* ========================== 宏定义 ========================== */
 
 #define MAX_FILEWRITERNAME_LEN      32
-#define FW_FORMAT_BUF_SIZE          1024    /* 格式化 buffer 大小（MemoryPool 元素大小） */
-#define FW_FORMAT_POOL_COUNT        8       /* MemoryPool 初始槽位数 */
+#define FW_FORMAT_BUF_SIZE          1024    /* Write 内部栈 buffer 大小（单条日志上限，超长截断） */
 #define FW_DATE_STR_LEN             16      /* "2026_07_11" 长度 */
 #define FW_DATETIME_STR_LEN         32      /* "2026-07-11-12-41-30" 长度 */
 #define FW_TIMESTAMP_STR_LEN        32      /* "[16:50:44.789550] " 长度 */
@@ -90,7 +88,6 @@ struct T_FILEWRITER
 
     /* ---- 依赖库句柄 ---- */
     T_StreamBuffer     *sb;                                /**< StreamBuffer 攒批缓冲 */
-    T_MemPool          *pool;                              /**< MemoryPool 格式化 buffer 池 */
 
     /* ---- 消费线程 ---- */
     pthread_t           thread_id;                         /**< 消费线程 ID（ThreadManage 创建） */

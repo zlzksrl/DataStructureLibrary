@@ -32,9 +32,6 @@ ThreadQueue_LIBINCPATH		= -I $(LIBFILE_PATH)/ThreadQueue/include
 StreamBuffer_LIBPATH		= -L $(LIBFILE_PATH)/StreamBuffer/StaticLib
 StreamBuffer_LIBINCPATH		= -I $(LIBFILE_PATH)/StreamBuffer/include
 
-MemoryPool_LIBPATH		    = -L $(LIBFILE_PATH)/MemoryPool/StaticLib
-MemoryPool_LIBINCPATH		= -I $(LIBFILE_PATH)/MemoryPool/include
-
 ThreadManage_LIBPATH		= -L $(LIBFILE_PATH)/ThreadManage/StaticLib
 ThreadManage_LIBINCPATH		= -I $(LIBFILE_PATH)/ThreadManage/include
 
@@ -48,7 +45,6 @@ CFLAGS  = -g -Wall -Wextra
 CFLAGS  := $(CFLAGS) -pthread
 CFLAGS  := $(CFLAGS) $(ThreadQueue_LIBINCPATH)
 CFLAGS  := $(CFLAGS) $(StreamBuffer_LIBINCPATH)
-CFLAGS  := $(CFLAGS) $(MemoryPool_LIBINCPATH)
 CFLAGS  := $(CFLAGS) $(ThreadManage_LIBINCPATH)
 
 # 位置无关代码编译选项（动态库必需）
@@ -58,11 +54,9 @@ PIC_FLAGS = -fPIC
 LDFLAGS = -pthread 
 LDFLAGS := $(LDFLAGS) $(ThreadQueue_LIBPATH) 
 LDFLAGS := $(LDFLAGS)  -lThreadQueue
-LDFLAGS := $(LDFLAGS) $(StreamBuffer_LIBPATH) 
+LDFLAGS := $(LDFLAGS) $(StreamBuffer_LIBPATH)
 LDFLAGS := $(LDFLAGS)  -lStreamBuffer
-LDFLAGS := $(LDFLAGS) $(MemoryPool_LIBPATH) 
-LDFLAGS := $(LDFLAGS)  -lMemoryPool
-LDFLAGS := $(LDFLAGS) $(ThreadManage_LIBPATH) 
+LDFLAGS := $(LDFLAGS) $(ThreadManage_LIBPATH)
 LDFLAGS := $(LDFLAGS)  -lThreadManage
 # ==============================================================================
 # 源文件与目标文件

@@ -2,7 +2,7 @@
  * @file        FileWriter.c
  * @brief       LinuxARM-PublicLib-异步文件写入-核心实现文件
  * @details     IMX6ULL平台
- *              基于 StreamBuffer（攒批）+ MemoryPool（格式化 buffer）+ ThreadManage（消费线程）。
+ *              基于 StreamBuffer（攒批）+ ThreadManage（消费线程）。
  *              内置消费线程：Wait→GetData→fwrite→fflush，按大小/跨日/手动轮转。
  *
  *              线程模型:
@@ -14,7 +14,7 @@
  *              并发保护:
  *              - fp / current_* / file_seq / file_written / current_date / stat_* 由 file_lock 保护
  *              - thread_running / shutting_down 为 volatile int（跨线程标志位）
- *              - StreamBuffer / MemoryPool 各自内部线程安全
+ *              - StreamBuffer 内部线程安全
  *
  * @author      zlzksrl
  * @Version     V1.0.0
@@ -694,7 +694,6 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
 {
     T_FileWriter *pt;
     T_StreamBufferConfig sb_cfg;
-    T_MemPoolConfig mp_cfg;
     T_ThreadCreateConfig th_cfg;
     int prio;
     int rc;
@@ -764,21 +763,6 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     fw_get_date_str(pt->current_date, sizeof(pt->current_date));
     pt->file_seq = 0;
 
-    /* 先初始化 MemoryPool（避免 fopen 后失败留空文件） */
-    memset(&mp_cfg, 0, sizeof(mp_cfg));
-    mp_cfg.element_size = FW_FORMAT_BUF_SIZE;
-    mp_cfg.init_count   = FW_FORMAT_POOL_COUNT;
-    mp_cfg.mode         = MEMPOOL_MODE_DROP;
-    mp_cfg.grow_count   = 0;
-    mp_cfg.block_timeo  = 0;
-    if(MemPoolAPI_Init(&pt->pool, &mp_cfg, "fw_pool") != 0)
-    {
-        printf("MemPool init fail ##%s->%d\n", __FUNCTION__, __LINE__);
-        pthread_mutex_destroy(&pt->file_lock);
-        free(pt);
-        return -1;
-    }
-
     /* StreamBuffer */
     memset(&sb_cfg, 0, sizeof(sb_cfg));
     sb_cfg.iCapacity   = (pt->config.buffer_capacity > 0) ? pt->config.buffer_capacity : FW_DEFAULT_BUFFER_CAPACITY;
@@ -786,7 +770,6 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     if(StreamBufferAPI_Init(&pt->sb, &sb_cfg, "fw_sb") != 0)
     {
         printf("StreamBuffer init fail ##%s->%d\n", __FUNCTION__, __LINE__);
-        MemPoolAPI_Destroy(&pt->pool);
         pthread_mutex_destroy(&pt->file_lock);
         free(pt);
         return -1;
@@ -809,7 +792,6 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     if(0 != rc)
     {
         StreamBufferAPI_Destroy(&pt->sb);
-        MemPoolAPI_Destroy(&pt->pool);
         pthread_mutex_destroy(&pt->file_lock);
         free(pt);
         return -1;
@@ -857,7 +839,6 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
             }
             pthread_mutex_unlock(&pt->file_lock);
             StreamBufferAPI_Destroy(&pt->sb);
-            MemPoolAPI_Destroy(&pt->pool);
             pthread_mutex_destroy(&pt->file_lock);
             free(pt);
             return -1;
@@ -906,9 +887,8 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
     }
     pthread_mutex_unlock(&pt->file_lock);
 
-    /* 5. 销毁 StreamBuffer + MemoryPool */
+    /* 5. 销毁 StreamBuffer */
     StreamBufferAPI_Destroy(&pt->sb);
-    MemPoolAPI_Destroy(&pt->pool);
 
     /* 6. 销毁锁、释放结构体 */
     pthread_mutex_destroy(&pt->file_lock);
@@ -923,43 +903,15 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
 
 int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
 {
-    char *buf;
+    char buf[FW_FORMAT_BUF_SIZE];
     int offset = 0;
     int n;
     int fmt_len;
-    int ret;
     va_list ap;
 
     if(NULL == fw || NULL == fmt || !fw->init_done)
     {
         return -1;
-    }
-
-    /* 从 MemoryPool 取 buffer；池满则用栈兜底 */
-    buf = (char *)MemPoolAPI_Alloc(fw->pool);
-    if(NULL == buf)
-    {
-        char stack_buf[FW_FORMAT_BUF_SIZE];
-        int off = 0;
-
-        if(fw->config.timestamp)
-        {
-            fw_get_timestamp_str(stack_buf, FW_TIMESTAMP_STR_LEN);
-            off = (int)strlen(stack_buf);
-        }
-        va_start(ap, fmt);
-        n = vsnprintf(stack_buf + off, sizeof(stack_buf) - off, fmt, ap);
-        va_end(ap);
-        if(n < 0)
-        {
-            return -1;
-        }
-        /* n 是"若空间够会写入的字节数"；超长时截断到 buffer 末尾 */
-        if(n > (int)sizeof(stack_buf) - off - 1)
-        {
-            n = (int)sizeof(stack_buf) - off - 1;
-        }
-        return StreamBufferAPI_PutData(fw->sb, stack_buf, off + n);
     }
 
     /* 时间戳前缀 */
@@ -971,25 +923,21 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
 
     /* 格式化（用 vsnprintf 返回值算总长，省一次 strlen） */
     va_start(ap, fmt);
-    n = vsnprintf(buf + offset, FW_FORMAT_BUF_SIZE - offset, fmt, ap);
+    n = vsnprintf(buf + offset, sizeof(buf) - offset, fmt, ap);
     va_end(ap);
     if(n < 0)
     {
-        MemPoolAPI_Free(fw->pool, buf);
         return -1;
     }
-    if(n > FW_FORMAT_BUF_SIZE - offset - 1)
+    /* n 是"若空间够会写入的字节数"；超长时截断到 buffer 末尾 */
+    if(n > (int)sizeof(buf) - offset - 1)
     {
-        n = FW_FORMAT_BUF_SIZE - offset - 1;
+        n = (int)sizeof(buf) - offset - 1;
     }
     fmt_len = offset + n;
 
-    /* 入队 */
-    ret = StreamBufferAPI_PutData(fw->sb, buf, fmt_len);
-
-    /* 归还 buffer */
-    MemPoolAPI_Free(fw->pool, buf);
-    return ret;
+    /* 入队（StreamBuffer 内部 memcpy，返回后 buf 可复用/释放） */
+    return StreamBufferAPI_PutData(fw->sb, buf, fmt_len);
 }
 
 int FileWriterAPI_WriteBin(T_FileWriter *fw, const void *data, int len)
