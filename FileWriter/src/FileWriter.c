@@ -806,7 +806,7 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     th_cfg.pThreadFuncUserArg = pt;
     th_cfg.sThreadName        = pt->name;
     th_cfg.eSetAttr           = 2;                         /* 配置全部属性 */
-    th_cfg.istacksize_MB      = 1;
+    th_cfg.istacksize_MB      = 2;
     th_cfg.eDetachState       = PTHREAD_CREATE_JOINABLE;
     th_cfg.einheritsched      = PTHREAD_EXPLICIT_SCHED;    /* 显式使用下面的策略/优先级 */
     th_cfg.eSchedPolicy       = SCHED_RR;                  /* 需求 D2：SCHED_RR 轮转 */
