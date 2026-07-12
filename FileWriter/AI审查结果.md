@@ -1,187 +1,96 @@
-# FileWriter 代码审查报告（四轮）
+# FileWriter 代码审查报告（五轮）
 
 > **审查范围**：`include/FileWriter.h` / `src/FileWriter_Main.h` / `src/FileWriter.c` / `debug/main.c` / `debug/Makefile`
-> **审查日期**：2026-07-12
-> **审查目标**：**新增"抗并发销毁"机制**的正确性 + 常规问题回归
-> **对照基线**：`AI审查结果.md`（三轮，2026-07-12 上午）
-> **总体结论**：抗并发销毁的整体思路是对的（两阶段释放 + 原子引用计数），**但 Phase B 的 store/load 分两步操作存在竞态**，可能引发**双重 `fw_final_free` → UAF/mutex 双销毁 / SB 双销毁 / 双 free**。必修 1 项、建议修 1 项、其他风格建议若干。
+> **审查日期**：2026-07-12（晚间）
+> **审查目标**：验证四轮 F1/F2 修复是否正确，反查是否引入新问题
+> **对照基线**：`AI审查结果.md`（四轮，2026-07-12 早间）
+> **总体结论**：**F1（Phase B 双重释放）和 F2（跨日 rotate 静默）修复完全正确**。新增 `finalize_taken` 原子字段用 CAS 独占争抢释放权，并且 `date_changed` 从"查询+副作用"改为"纯查询"、`check_daily_rotate` 负责事务性回滚，两处都是教科书式的做法。此外顺带清理了四轮里的 V1（死代码）/ S1（版本 printf）/ S4（POLL 步长）/ S2（Init 文档），落地度高。**本轮新发现 1 处编译环境隐患 + 3 个小问题，无阻塞发布项。**
 
 ---
 
-## 零、三轮修复项回归
+## 零、四轮修复项验证
 
-| 三轮项 | 状态 | 说明 |
-|---|---|---|
-| R1 死代码参数 | ✅ | `fw_check_file_size_rotate_locked` 已删 `bytes_written` |
-| R6 Stats API | ✅ | `FileWriterAPI_StatsGet` + `T_FileWriterStats` 落地 |
-| R7 Flush 异步语义 | ✅ | 头文件 `@warning` 明确 |
-| R5 Rotate 阻塞 | ✅ | 头文件 `@warning` 明确 |
-| R4 查询接口锁内阻塞 | ✅ | 头文件查询区顶部 `@note` |
-| R11 降级路径栈大小 | ✅ | `eSetAttr=1 + istacksize_MB=2` |
-| R12 SB 实例名 | ✅ | `fw_<name>_sb` |
-| — 新增：**抗并发销毁** | 🔴 | 见本轮 F1 |
+| 四轮项 | 四轮结论 | 五轮验证 | 说明 |
+|---|---|---|---|
+| **F1** Phase B 双重释放 UAF | 🔴 必修 | ✅ 完全修复 | 新增 `finalize_taken` + CAS(0→1) 独占释放权 |
+| **F2** 跨日 rotate 失败 24h 静默 | 🟡 建议修 | ✅ 完全修复 | `date_changed` 纯查询，`check_daily_rotate` 事务性 |
+| V1 ENTER_GUARD 死代码分支 | 🟢 低 | ✅ 已清理 | 删除 fetch_add 后复检失败分支中的 `fw_final_free` |
+| S1 版本 printf | 🟢 低 | ✅ 已删 | 无残留 |
+| S2 Init 文档补抗并发说明 | 🟢 低 | ✅ 已加 | `FileWriter.h:170-173` 明确写了 |
+| S3 GUARD 宏改名 | 🟢 低 | ❌ 未改 | 名字仍是 `FW_ENTER_GUARD`，非阻塞 |
+| S4 POLL 步长 100→500us | 🟢 低 | ✅ 已改 | `FW_DESTROY_POLL_US = 500` |
+| S5 加并发销毁测试 | 🟢 低 | ❌ 未加 | 测试覆盖仍待补 |
 
-三轮修复回归全部通过。本轮的问题主要出在**新增的抗并发销毁机制**里。
-
----
-
-## 一、必修问题
-
-### F1. 🔴🔴🔴 Phase B 的 `atomic_store(destroy_pending)` + `atomic_load(ref_count)` 分两步操作产生 UAF
-
-**位置**：`FileWriter.c:1024-1044`
-
-```c
-/* B1. 置 destroy_pending=1（release） */
-atomic_store_explicit(&pt->destroy_pending, 1, memory_order_release);
-
-/* B2. 再检查一次 ref_count */
-ref_left = atomic_load_explicit(&pt->ref_count, memory_order_acquire);
-if(0 == ref_left)
-{
-    *pp = NULL;
-    fw_final_free(pt);
-    return 0;
-}
-
-/* B3. 交给最后一个出保护区的 Writer 兜底 */
-```
-
-**竞态时序**（业务线程 A 在保护区内做慢操作 + Destroy 超时后走 Phase B）：
-
-```
-T=0   Writer A：入保护区，ref_count=1，正在做慢操作（fwrite 大块 / vsnprintf 长日志）
-T=1   Destroy：destroying=1 → Close SB → join 消费线程 → spin-wait 500ms 超时
-T=2   Destroy：ref_left = load(ref_count) = 1 → 走 Phase B
-T=3   Destroy：atomic_store(destroy_pending, 1, release)   [B1 完成]
-T=4   ★ 竞态窗口 ★
-        Writer A 恰好在此瞬间完成慢操作，进入 FW_LEAVE_GUARD：
-          fetch_sub(ref_count, 1) → 从 1 变 0（_r 返回旧值 1）
-          load(destroy_pending) → 见到 1（B1 已 release）
-          → 调 fw_final_free(fw)   ★ 第一次释放 ★
-T=5   Destroy：走 B2：load(ref_count) = 0
-          → 判断"归 0 了，我兜底"
-          → 调 fw_final_free(fw)   ★ 第二次释放 ★
-        → StreamBufferAPI_Destroy(NULL) / pthread_mutex_destroy(已销毁) / free(已释放)
-        → UAF / double-free / coredump
-```
-
-**触发条件**：
-- Destroy 与 Write 真正并发（本轮新增机制的目标场景）
-- 至少一个 Writer 卡在保护区超过 `destroy_wait_ms`（500ms 默认）
-- Writer 完成的瞬间正好落在 B1 与 B2 之间
-
-**触发概率**：低但确实存在。生产环境慢操作（长日志/大 fwrite）多 + 磁盘抖动时，B1/B2 之间时钟差是纳秒~微秒级，Writer 在此窗口完成完全可能。
-
-**根因**：`destroy_pending` 的置位和 `ref_count` 的复检不是原子操作，形成**"两个观察者都认为自己是最后一个"**的经典 race。
-
-**修法**：用 `atomic_compare_exchange_strong` 把 B1 变成"独占的置位"，配合复检次序保证释放责任互斥。核心逻辑：
-
-```c
-/* Phase B：CAS 独占置 destroy_pending 0→1，然后复检 */
-int expected = 0;
-atomic_compare_exchange_strong_explicit(
-    &pt->destroy_pending, &expected, 1,
-    memory_order_acq_rel, memory_order_acquire);
-/* CAS 一定成功（Destroy 只调一次，无并发写 destroy_pending）。
- * 关键是 CAS 建立了一个明确的时间点："此后 LEAVE 的 Writer 看到 =1"。 */
-
-ref_left = atomic_load_explicit(&pt->ref_count, memory_order_acquire);
-if(0 == ref_left)
-{
-    /* 所有 Writer 已 LEAVE，且它们 LEAVE 时看到的 destroy_pending 一定是 0
-     * （CAS 之前的所有 load 都读到旧值 0），所以它们不会调 fw_final_free。
-     * 由本函数兜底释放。 */
-    *pp = NULL;
-    fw_final_free(pt);
-    return 0;
-}
-/* 仍有 Writer 在保护区。它们后续 LEAVE 时会看到 destroy_pending=1
- * （acq_rel 保证），由最后一个（fetch_sub 返回 1）调 fw_final_free。 */
-```
-
-**这样为什么对**：CAS 是**一个原子指令**——它把"置 destroy_pending=1"这个动作压缩到一个不可分割的时间点。CAS 前的所有 LEAVE 者看到的 destroy_pending 是 0（不释放）；CAS 后的所有 LEAVE 者看到的是 1（可能释放）。Destroy 侧的复检 `ref_count == 0` 意味着"CAS 之前 Writer 已经全部 LEAVE"——他们不会调 final_free，所以 Destroy 兜底。反之若 ref_count > 0，Destroy 交给后续 LEAVE 者，最后一个必然独占地完成释放。
-
-**紧急度**：🔴 必修。发布前必须修掉。
+**核心两项 F1/F2 完全落地，未引入回归。**
 
 ---
 
-## 二、建议修问题
+## 一、F1 修复复审：`finalize_taken` CAS 独占释放权
 
-### F2. 🟡 跨日 rotate 失败，`current_date` 已被更新，24 小时内不再触发跨日轮转
+### 修改要点
 
-**位置**：`FileWriter.c:258-269`（`fw_date_changed_locked`） + `FileWriter.c:615-622`（`fw_check_daily_rotate_locked`）
+新增第 4 个原子字段 `finalize_taken`（`FileWriter_Main.h:118-122`），三处使用点用 CAS(0→1) 抢占：
 
+1. **`FW_LEAVE_GUARD`**（`FileWriter.c:99-110`）：
 ```c
-/* fw_date_changed_locked */
-if(strcmp(today, fw->current_date) != 0)
-{
-    strncpy(fw->current_date, today, ...);   // ← 已更新到今天
-    return 1;
-}
-
-/* fw_check_daily_rotate_locked */
-if(fw->config.auto_rotate_daily && fw_date_changed_locked(fw))
-{
-    return fw_rotate_locked(fw);   // ← 若失败？
-}
-```
-
-**场景**：跨 0 点瞬间 `fw_rotate_locked` 因磁盘满/权限/目录创建失败返回 -1。此时：
-- `current_date` 已经 = 今天
-- `fp` 仍指向昨天目录的旧文件
-- 数据继续写入昨天的目录
-- 下次 date_changed 检查：`current_date` 就是今天，返回 0，不再触发
-
-**结果**：整整 24 小时数据都在昨天目录，直到明天再次跨日才可能自愈。用户完全无感（除非查 stat_rotate_fail）。
-
-**修法**：`current_date` 的更新推迟到 `fw_rotate_locked` 成功之后：
-
-```c
-static int fw_check_daily_rotate_locked(T_FileWriter *fw)
-{
-    char today[FW_DATE_STR_LEN];
-    fw_get_date_str(today, sizeof(today));
-    if(!fw->config.auto_rotate_daily) return 0;
-    if(strcmp(today, fw->current_date) == 0) return 0;
-
-    /* 先尝试 rotate，成功后再更新 current_date；失败下次还会重试 */
-    int rc = fw_rotate_locked(fw);   /* rotate 内部 build_paths 会用 current_date */
-    /* 但 rotate 内部 build_paths 用的 current_date 还是旧的！需要临时切换 */
-    ...
-}
-```
-
-其实更简单的方法：**把 `current_date` 的更新拆到 rotate 内部**——rotate 里先探测目录能否创建、成功后才更新 current_date。或者：
-
-```c
-static int fw_check_daily_rotate_locked(T_FileWriter *fw)
-{
-    char today[FW_DATE_STR_LEN];
-    char saved_date[FW_DATE_STR_LEN];
-    int rc;
-
-    if(!fw->config.auto_rotate_daily) return 0;
-
-    fw_get_date_str(today, sizeof(today));
-    if(strcmp(today, fw->current_date) == 0) return 0;
-
-    /* 保存旧日期，切换到新日期做 rotate；失败则回滚 */
-    memcpy(saved_date, fw->current_date, sizeof(saved_date));
-    strncpy(fw->current_date, today, sizeof(fw->current_date) - 1);
-    fw->current_date[sizeof(fw->current_date) - 1] = '\0';
-
-    rc = fw_rotate_locked(fw);
-    if(rc != 0)
-    {
-        memcpy(fw->current_date, saved_date, sizeof(fw->current_date));
+int _r = atomic_fetch_sub_explicit(&(fw)->ref_count, 1, memory_order_acq_rel);
+if(_r == 1 && atomic_load_explicit(&(fw)->destroy_pending, memory_order_acquire)) {
+    int _exp = 0;
+    if(atomic_compare_exchange_strong_explicit(
+            &(fw)->finalize_taken, &_exp, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        fw_final_free(fw);
     }
-    return rc;
+    /* CAS 失败：Destroy 已抢先，我什么都不做 */
 }
 ```
 
-同时 `fw_date_changed_locked` 改为**只查询不写**：
+2. **Destroy A7 干净路径**（`FileWriter.c:1046-1062`）：先 load ref_count == 0 → 用 CAS 抢 → 抢到才 free。
 
+3. **Destroy B2 兜底路径**（`FileWriter.c:1072-1087`）：B1 之后再次 load ref_count == 0 → CAS 抢。抢不到说明 Writer 已抢先（B1 之后 LEAVE 的 Writer 看到 destroy_pending=1 有资格 CAS）。
+
+### 对抗性时序推演
+
+**场景 A**（正常 Phase A 归零）：
+- ref_count 在 A6 spin-wait 期间归 0 → A7 复检 == 0 → CAS 成功 → Destroy free。
+- Writer 已 LEAVE，那时 destroy_pending==0，LEAVE 侧 CAS 分支根本不进。**✓**
+
+**场景 B**（Phase B 双重释放风险窗口，四轮报告的核心 race）：
+```
+Destroy:       Writer:
+B1 store(dp=1)
+               fetch_sub → 0
+               load(dp) = 1
+               CAS(ft, 0→1)  ← Writer 想抢
+B2 load(rc)=0
+CAS(ft, 0→1)  ← Destroy 也想抢
+```
+硬件保证 `compare_exchange_strong` 是原子的，两者同时执行只有一个赢，另一个 `expected` 被更新为 1、CAS 返回 false。**Race 消除。✓**
+
+**场景 C**（Writer 在 B1 之前完成 LEAVE，Destroy 尚未 B1）：
+- Writer LEAVE 时 load(destroy_pending) == 0 → 不进 CAS 分支 → 直接走出。
+- Destroy 走到 B1 store → B2 load(rc)=0 → CAS 成功 → Destroy free。**✓**
+
+**场景 D**（Destroy A7 干净归零，但 CAS 失败）：
+代码注释里说"几乎不可能"——因为 destroy_pending 尚未置位，Writer LEAVE 侧不会走 CAS 分支。**真的不可能**，属于防御性代码。可留可删。
+
+**验证结论**：F1 修复**逻辑严密**，对抗性推演通过所有关键分支。
+
+### memory_order 复核
+
+- CAS 用 `memory_order_acq_rel`（成功）+ `memory_order_acquire`（失败）— 标准配置，正确。
+- ref_count 用 `memory_order_acq_rel` — 建立发布/获取关系，正确。
+- destroying / destroy_pending 的 store 用 `release`，load 用 `acquire` — 严格正确。
+
+**无 memory_order 遗漏。**
+
+---
+
+## 二、F2 修复复审：`date_changed` 纯查询 + `check_daily` 事务性
+
+### 修改要点
+
+**`fw_date_changed_locked`**（`FileWriter.c:269-275`）改成**只查询不写**：
 ```c
 static int fw_date_changed_locked(T_FileWriter *fw)
 {
@@ -191,141 +100,221 @@ static int fw_date_changed_locked(T_FileWriter *fw)
 }
 ```
 
-**紧急度**：🟡 中。触发要求"跨日 + Rotate 失败"双条件，但触发后完全静默 24h，问题严重。
-
----
-
-## 三、验证通过但值得留意（不修）
-
-### V1. `FW_ENTER_GUARD` 内 fetch_add 后复检 destroying=1 的 final_free 分支是死代码
-
-**位置**：`FileWriter.c:82-88`
-
+**`fw_check_daily_rotate_locked`**（`FileWriter.c:627-655`）负责事务：
 ```c
-if(atomic_load(&fw->destroying)) {
-    _r = atomic_fetch_sub(&fw->ref_count, 1);
-    if(_r == 1 && atomic_load(&fw->destroy_pending)) {
-        fw_final_free(fw);        // ← 死代码分支
-    }
-    return err;
+if(!fw_date_changed_locked(fw)) return 0;
+
+fw_get_date_str(today, sizeof(today));
+memcpy(saved_date, fw->current_date, sizeof(saved_date));
+strncpy(fw->current_date, today, ...);   // 切到今天
+
+rc = fw_rotate_locked(fw);
+if(0 != rc)
+{
+    memcpy(fw->current_date, saved_date, sizeof(fw->current_date));   // 失败回滚
 }
+return rc;
 ```
 
-要让这个 `fw_final_free` 被调用需要：
-1. 第一次 load destroying = 0（否则第一行就 return）
-2. fetch_add 之后 destroying = 1
-3. 此时 destroy_pending 也已经 = 1
-4. 且此 Writer 是最后一个引用（_r == 1）
+### 时序推演
 
-Phase B 的 destroy_pending=1 在时序上一定在 destroying=1 之后（Destroy Phase A 完成才进 Phase B），所以第一次 load destroying = 0 的时刻，destroy_pending 也必然 = 0。**这个分支的 destroy_pending == 1 条件在语义上不可达**。
+**场景 A**（跨日成功）：切 date → rotate 成功 → current_date 保持今天。**✓**
 
-**建议**：删除或改成 `assert(destroy_pending == 0)`。不修也没问题，只是死代码降低可读性。
+**场景 B**（跨日+磁盘满）：切 date → rotate 失败 → current_date 回滚为昨天 → 下一批数据触发 `date_changed` 仍返回 1 → 继续重试。**避免 24h 静默。✓**
 
-**紧急度**：🟢 低。
+**场景 C**（rotate 失败但 build_paths 已经成功）：
+`fw_rotate_locked` 内部先 drain_sb → seq+1 → build_paths → open_new_file，任一步失败都会 `saved_seq` 回滚 seq。build_paths 会创建"今天的目录"（此时 current_date 已是今天）——即使 open_new_file 失败，**目录已创建**，下次重试时 build_paths 只是 idempotent 走一遍（`fw_make_dirs` 视 EEXIST 为成功）。**副作用是磁盘上留了空目录，无害。**
 
----
+**验证结论**：F2 修复**行为正确**，边界处理完整。
 
-### V2. Init 里 `atomic_init` 与 `memset` 的关系
+### 微小观察
 
-**位置**：`FileWriter.c:786`（memset）+ `FileWriter.c:819-821`（atomic_init）
-
-C11 严格说：未 `ATOMIC_VAR_INIT` 或 `atomic_init` 的原子对象访问是 UB。这里先 `memset` 归零再 `atomic_init`，形式上正确。glibc/GCC 实现下 `atomic_int` 本质是普通 int，memset 归零后立即可用 —— 但依赖实现。
-
-`atomic_init` 本身不是原子操作（C11 §7.17.2.2/2），要求"在其他线程访问前"调用。此处消费线程尚未创建、外部无并发，**安全**。
-
-**紧急度**：🟢 无。
+回滚 memcpy 使用 `sizeof(fw->current_date)` 拷贝完整 16 字节数组，而不是 `strlen + '\0'`。因为 `saved_date` 是通过 `memcpy(..., sizeof(saved_date))` 保存的完整数组内容，两边一致，正确。若哪天 `FW_DATE_STR_LEN` 变化，两处 sizeof 都会自动同步。**代码风格干净。**
 
 ---
 
-### V3. 消费线程读 `fw->thread_running`（volatile int）无显式内存屏障
+## 三、新发现的问题
 
-**位置**：`FileWriter.c:653`
+### N1. 🟡 Makefile 未指定 `-std=c11`，`<stdatomic.h>` 依赖工具链默认标准
 
-`while(fw->thread_running)` 中 volatile 只防编译器优化，不保证跨 CPU 可见。**但每轮循环调 `StreamBufferAPI_Wait` 内部有 mutex，隐式建立 acquire/release**，能感知主线程写。Destroy 里 `pt->thread_running = 0` 之后紧跟 `StreamBufferAPI_Flush`（内部有 mutex 唤醒），同样建立屏障。
+**位置**：`debug/Makefile:44-48`
 
-**验证通过**：当前实现正确，但脆弱——未来若改成"完全无锁的 SB API"或 flush_ms=0 使 Wait 立返，就可能出问题。
+```makefile
+CFLAGS  = -g -Wall -Wextra 
+CFLAGS  := $(CFLAGS) -pthread
+CFLAGS  := $(CFLAGS) $(...)
+```
 
-**紧急度**：🟢 无（当前正确）。
+**问题**：本轮引入 `<stdatomic.h>`（`FileWriter_Main.h:39`），这是 **C11 标准头文件**。GCC 4.9+ 支持，但**默认 C 标准**依 GCC 版本：
+- GCC 4.9 ~ 7.x：默认 `-std=gnu11`（已支持）
+- GCC 8+：默认 `-std=gnu17`（已支持）
+- GCC 4.7~4.8：不支持 `<stdatomic.h>`
 
----
+`arm-linux-gnueabihf-gcc` 在 Ubuntu 20.04 上通常是 GCC 7 或 GCC 9，OK。但**如果工程被移植到老版工具链**（如 IMX6ULL 的官方 SDK 内嵌 GCC 4.7），会编译不过报 `stdatomic.h: No such file or directory`。
 
-### V4. `FileWriterAPI_StatsGet` 内部调用 `FileWriterAPI_GetFileCount`，导致 ref_count 瞬时 = 2
+**建议**：显式加 `-std=gnu11`：
+```makefile
+CFLAGS  = -g -Wall -Wextra -std=gnu11
+```
 
-代码里已有注释确认。**验证通过**：Destroy spin-wait 只关心归 0，重入线程完整 LEAVE 后必然归 0。
+用 `gnu11` 而不是 `c11` 是因为 `pthread.h`、`clock_gettime` 等 POSIX 扩展需要 `_GNU_SOURCE`；`gnu11` 默认打开。也可以两个都写：`-std=c11 -D_GNU_SOURCE`。
 
----
-
-## 四、代码风格 / 文档
-
-### S1. 版本 printf 未删
-
-**位置**：`FileWriter.c:778`
-
-上一轮讨论中你决定保留（可重入不引入静态变量）+"测试完毕删除"。**当前仍在**，请在正式发布前删。
-
----
-
-### S2. 头文件 Init 说明未提及抗并发销毁
-
-**位置**：`FileWriter.h:163-179`
-
-Destroy 的 doxygen 已详述 Phase A/B，但 Init 那里只字未提。建议在 Init 说明里补一句：
-
-> **抗并发销毁**：Init 后本实例的 Write/WriteBin/Flush/Rotate/查询接口支持与 Destroy 并发（详见 Destroy 的 `@details` 与 `config.destroy_wait_ms`）。
+**紧急度**：🟡 中。当前工具链下能编，跨环境时会踩坑。
 
 ---
 
-### S3. GUARD 宏内隐含 `return err` 可读性差
+### N2. 🟢 Destroy Phase A A7 干净路径的 CAS 失败注释理由不完全对
 
-**位置**：`FileWriter.c:78-89`
+**位置**：`FileWriter.c:1058-1061`
 
-`FW_ENTER_GUARD(fw, -2);` 这一行在源码里看不出"如果销毁中会替我 return"。建议改名为 `FW_ENTER_OR_RETURN(fw, err)`，或改成函数返回 bool 让调用点显式 `if(!fw_enter(fw)) return err;`。
+```c
+/* 走到这里说明有 Writer 抢先 CAS 成功——但这几乎不可能：
+ * destroy_pending 未置位，LEAVE 侧的 CAS 分支进不去。留作防御。 */
+*pp = NULL;
+return 0;
+```
 
-**紧急度**：🟢 低。
+**问题**：注释说"destroy_pending 未置位"是对的（A7 里 destroy_pending 确实还是 0）。但注释还说"有 Writer 抢先 CAS 成功"——**这个分支实际上是走不到的**。如果 A7 时 destroy_pending==0，任何 Writer LEAVE 都不进 CAS 分支，`finalize_taken` 必然保持 0，Destroy 的 CAS 必然成功。
 
----
+**结论**：这段 else 分支是**真死代码**，不是"防御"。可以：
+- 删掉（干净）；
+- 或改成 `assert(0 && "unreachable: no Writer can CAS ft before destroy_pending=1")`。
 
-### S4. `FW_DESTROY_POLL_US = 100` 轮询过密
-
-**位置**：`FileWriter_Main.h:65`
-
-500ms 超时 / 100us 步长 = 每次 Destroy 最多 5000 次 spin。改成 500us 或 1000us，响应仍在毫秒级，CPU 占用下降 5-10 倍。IMX6ULL 上尤其明显。
-
----
-
-### S5. `debug/main.c` 缺"Destroy 与 Write 并发"用例
-
-如果宣称抗并发销毁，测试用例必须覆盖之。建议加 Part 8：
-- 起一个业务线程持续 Write 500ms
-- 主线程 300ms 时调 Destroy
-- 观察是否有崩溃、日志是否有 "destroy deferred"
-- 用 valgrind / ASan / TSan 跑一遍
+**紧急度**：🟢 低（不影响正确性，只是死代码 + 注释误导）。
 
 ---
 
-## 五、修复优先级
+### N3. 🟢 `FileWriter_Main.h:76-77` 的"并发访问约定"里 volatile 描述已过时
 
-| 优先级 | 项 | 影响 | 改动量 |
+**位置**：`FileWriter_Main.h:76-77`
+
+```
+/*    - volatile 字段：跨线程读写，靠 volatile 保证可见性 + 消费线程  */
+/*      每轮都会经过 mutex（间接建立内存屏障）。                       */
+```
+
+**问题**：现在结构体里除了 `thread_running` / `shutting_down` 是 `volatile int`，还有 `ref_count`/`destroying`/`destroy_pending`/`finalize_taken` 四个 `atomic_int`。注释块只提 volatile，没提 atomic，读者会疑惑那四个 atomic 字段属于哪一类保护。
+
+**建议**：注释块补一条：
+```
+ *    - atomic_int 字段（ref_count/destroying/destroy_pending/finalize_taken）:
+ *      无锁访问，用 memory_order_acquire/release/acq_rel 显式指定顺序；
+ *      详见 FileWriter.c 顶部 FW_ENTER_GUARD/LEAVE_GUARD 宏。
+```
+
+**紧急度**：🟢 低（文档）。
+
+---
+
+### N4. 🟢 `FileWriter.c` 文件头 doxygen 未同步"抗并发销毁"
+
+**位置**：`FileWriter.c:1-23`
+
+文件头说"并发保护: fp 由 file_lock 保护，thread_running 由 volatile"——但没提本轮的抗并发销毁机制、`FW_ENTER_GUARD` 宏、Phase A/B 释放策略。头文件公共 API 已经写了，但 `.c` 文件头还是老的。
+
+**建议**：文件头 `@details` 补一段"抗并发销毁"，与头文件保持一致。
+
+**紧急度**：🟢 低（文档）。
+
+---
+
+## 四、代码质量抽查
+
+### 大括号风格（if/while/for 全大括号 + 独占行）
+
+```bash
+grep -nE '^\s*(if|while|for)\s*\([^)]*\)\s*[a-zA-Z_]' src/*.c src/*.h include/*.h debug/main.c | grep -v sizeof | grep -v '(int)w'
+```
+结果：仅"(int)w" 类型转换误判，**实际全部符合风格**。✓
+
+### GUARD 配对
+
+```bash
+grep -nE 'FW_ENTER_GUARD|FW_LEAVE_GUARD' src/FileWriter.c
+```
+所有 ENTER 都有对应的 LEAVE（含所有 error 分支的 LEAVE）：
+- `Write`（`1119` ENTER，`1136`/`1150` 双 LEAVE 覆盖 vsnprintf 失败 + 成功）
+- `WriteBin`（`1167`/`1169`）
+- `Rotate`（`1185`/`1190`）
+- `Flush`（`1202`/`1204`）
+- `GetCurrentFileName/Path/DirPath`（`1217/1222`, `1232/1237`, `1247/1252`）
+- `GetFileCount`（`1271` + `1286`/`1303` 双 LEAVE 覆盖 opendir 失败 + 成功）
+- `GetTotalFileCount`（`1319` + `1329`/`1342` 双 LEAVE）
+- `StatsGet`（`1356`/`1381`）
+
+**全部匹配。✓**
+
+### memory_order 一致性
+
+所有 `atomic_load` 用 `acquire`，所有 `atomic_store` 用 `release`，`fetch_add/sub` 和 CAS 用 `acq_rel`——**教科书式的正确用法。✓**
+
+---
+
+## 五、验证情况
+
+| 需求 / 一轮修复项 | 本轮状态 |
+|---|---|
+| C1 事务性 Rotate | ✅ 保持 |
+| C2 fwrite 短写统计 | ✅ 保持 |
+| C3 delete_oldest 跳过当前 | ✅ 保持 |
+| C4 snprintf 边界检查 | ✅ 保持 |
+| D1 Write/WriteBin -3 返回值 | ✅ 保持 |
+| D2 Rotate 失败副作用文档 | ✅ 保持 |
+| D3 static 声明放头文件 → 挪到 .c | ✅ 保持 |
+| D4 Rotate 前 drain SB | ✅ 保持 |
+| R1 死代码参数删除 | ✅ 保持 |
+| R6 StatsGet API | ✅ 保持 |
+| R7 Flush 异步语义文档 | ✅ 保持 |
+| R5 Rotate 阻塞时长文档 | ✅ 保持 |
+| R11 降级路径栈大小 | ✅ 保持 |
+| R12 SB 实例名 | ✅ 保持 |
+| **F1 Phase B 双重释放** | ✅ **本轮修复** |
+| **F2 跨日 rotate 静默** | ✅ **本轮修复** |
+| V1 ENTER_GUARD 死代码 | ✅ 本轮清理 |
+| S1 LibVision printf | ✅ 本轮删除 |
+| S2 Init 文档补抗并发 | ✅ 本轮补齐 |
+| S4 POLL 500us | ✅ 本轮调整 |
+
+**无一处回归。**
+
+---
+
+## 六、修复优先级
+
+| 优先级 | 项 | 影响面 | 改动量 |
 |---|---|---|---|
-| 🔴 必修 | **F1** Phase B UAF | 多线程销毁并发场景下必现 | ~10 行（CAS 化） |
-| 🟡 中 | **F2** 跨日 rotate 失败静默 | 极端环境 24h 静默 | ~15 行 |
-| 🟢 低 | V1 死代码分支 | 可读性 | 删 3 行 |
-| 🟢 低 | S1 版本 printf | 日志清洁 | 1 行 |
-| 🟢 低 | S2 Init 文档补抗并发说明 | 文档 | 头文件 3 行 |
-| 🟢 低 | S3 GUARD 宏改名 | 可读性 | 全局重命名 |
-| 🟢 低 | S4 POLL 步长 | CPU 占用 | 1 行 |
-| 🟢 低 | S5 加并发销毁测试 | 测试覆盖 | main.c ~40 行 |
+| 🟡 建议 | **N1** Makefile 加 `-std=gnu11` | 跨工具链兼容性 | 1 行 |
+| 🟢 低 | N2 A7 CAS 失败注释更正 | 可读性 | 3 行 |
+| 🟢 低 | N3 Main.h 并发约定加 atomic | 文档 | 3 行 |
+| 🟢 低 | N4 FileWriter.c 文件头加抗并发描述 | 文档 | 5 行 |
+| 🟢 低 | S3 GUARD 宏改名 `FW_ENTER_OR_RETURN` | 可读性 | 全局重命名 |
+| 🟢 低 | S5 加并发销毁测试用例 | 测试覆盖 | main.c ~40 行 |
+
+**没有必修项。N1 建议在正式打 tag 前顺手加上。**
 
 ---
 
-## 六、总体评价
+## 七、总体评价
 
-- **抗并发销毁方向正确**：ref_count + destroying + destroy_pending 三原子字段 + 两阶段释放 + LEAVE 时接管释放责任，是经典的引用计数式安全销毁设计。
-- **F1 是新代码的经典 race**：两步原子操作总有窗口，用 CAS 合并即可，改动约 10 行。
-- **F2 是原有代码的边界问题**：三轮时没有触发（跨日 + rotate 失败双条件），但存在 24 小时静默的风险。修不修都可，但值得知道。
-- **测试覆盖不匹配新功能**：main.c 里没有跨线程 Destroy 用例，抗并发销毁的正确性目前**只靠推理未经实测**。
-- **常规质量高**：三轮修复项全部维持，风格 `if/while/for` 大括号一致，doxygen 完整，锁使用约定注释清晰。
+- **F1/F2 修复质量非常高**：直接命中根因，用 CAS 独占争抢 + 事务性回滚，是教科书级的做法。
+- **memory_order 使用严谨**：release/acquire/acq_rel 分工清晰，无遗漏。
+- **代码组织清晰**：GUARD 宏 + Phase A/B 结构 + `finalize_taken` 独占，逻辑一次读懂。
+- **文档同步度高**：Destroy 头 doxygen 已详述 Phase A/B，Init 也补了抗并发说明。
+- **小缺憾**：`.c` 文件头和 Main.h 的"并发约定"注释块没跟上抗并发销毁机制；Makefile 少 `-std=gnu11`。这些都是文档/环境细节，不影响运行。
 
-**建议**：F1 必修，S5 补测试并跑 TSan/valgrind，之后打 V1.1.0 tag。F2 视时间安排 —— 修比不修好，但生产环境要求苛刻的场合才必须修（跨日轮转失败本身就是罕见事件）。
+**结论**：**可以直接打 V1.1.0 tag 发布**。抗并发销毁的正确性经过 5 轮迭代已经稳固，四轮报告里的 F1 UAF 完全消除。剩下的 N1~N4 都是加分项，不阻塞。
 
-**串行使用（一线程 Write + 同一线程 Destroy）场景下当前代码完全正确**，即使 F1 不修也不会触发。F1 只在真正的多线程销毁并发下才是必现问题。
+**建议发布前动作**：
+1. Makefile 加 `-std=gnu11`（1 行，10 秒改完）；
+2. 在开发板上跑一次并发销毁的压力测试（业务线程持续 Write + 主线程 Destroy，重复 100 次），验证无 UAF/coredump；
+3. 更新 `readme.md` / `变更记录`，列出 V1.1.0 抗并发销毁能力。
+
+---
+
+## 附：`finalize_taken` CAS 是否可用 `_weak`
+
+题外话，`atomic_compare_exchange_strong_explicit` 在这里可以换成 `_weak`（可 spurious fail）吗？
+
+答：**不建议**。当前使用点都是"one-shot"（每个线程只 CAS 一次，不在循环里重试），`_weak` 的伪失败会让本该抢到释放权的线程放弃，从而**内存泄漏**（没人 free 了）。**保持 `_strong` 正确。**
+
+若哪天改成循环重试 CAS，才应该用 `_weak`（更好的 ARM 汇编生成）。当前实现选择 `_strong` 是正确的。
