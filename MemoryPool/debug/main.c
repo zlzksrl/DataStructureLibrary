@@ -433,6 +433,14 @@ static void test_init_bounds(void)
     MemPoolAPI_Init(&pb, &cfg, "block_neg");
     TEST_ASSERT(MemPoolAPI_AllocBlock(pb, -1) == NULL, "AllocBlock(-1) returns NULL");
     MemPoolAPI_Destroy(&pb);
+
+    /* 12.8 非 GROW 模式下 grow_count 负数 Init 加严拒绝（P3-5） */
+    {
+        T_MemPool *pn = NULL;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.element_size = 8; cfg.init_count = 4; cfg.mode = MEMPOOL_MODE_DROP; cfg.grow_count = -100;
+        TEST_ASSERT(MemPoolAPI_Init(&pn, &cfg, "neg_grow") == -1, "reject grow_count<0 in non-GROW");
+    }
 }
 
 

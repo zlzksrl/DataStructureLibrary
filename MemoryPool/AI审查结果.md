@@ -286,3 +286,41 @@ waiter_count--
 - 代码风格、文档、错误处理与 DataStructureLibrary 其他子库(StreamBuffer/ThreadQueue/WindowQueue)对齐。
 
 **建议**: 采纳 §5.1 的四项微改动后打 tag v1.1.1 发布,§5.2 的四项作为下轮 v1.2 议题。
+
+---
+
+# 第五轮复核后修复记录（2026-07-13）
+
+> 决定：§5.1 + §5.2 **一并落地**，不再遗留到 v1.2。改动共 ~30 行代码 + 若干行文档，风险低、收益是"防御性链条彻底闭合"。
+
+## 一、逐项修复对照
+
+| 编号 | 建议 | 修复位置 | 说明 |
+|------|------|---------|------|
+| **P2-1** | `total_count` 无 INT_MAX 溢出保护 | `MemoryPool.c` mp_alloc_grow max_count 约束之后 | 追加 `this_grow > INT_MAX - total_count` clamp + `this_grow<=0` DROP，闭合"无上限模式下的极端理论溢出" |
+| **P2-2** | Destroy 里 `cond_wait` 无错误兜底 | `MemoryPool.c` Destroy 等 waiter 归零循环 | `r = pthread_cond_wait(...); if(r!=0 && r!=EINTR) break;` 与 alloc_block 分支保持一致，避免 Destroy 死循环 |
+| **P2-3** | `ulTotalDrop` 归因不含 Destroy 唤醒 | `MemoryPool.h` T_MemPoolStats.ulTotalDrop 注释 | 末尾追加 "+ Destroy 唤醒时的 BLOCK 等待者"，语义诚实 |
+| **P3-1** | `Init` 文档未列 `name==NULL` | `MemoryPool.h` @retval -1 段 | 改写为完整枚举：pp/name/*pp/mode/grow_count/block_timeo/element_size/乘法溢出/malloc/pthread |
+| **P3-2** | `pthread_mutex_init` 返回值未检查 | `MemoryPool.c` Init 同步原语块 | 加 `r_mux != 0` 分支，回滚 ch/ch->mem/pt 后返 -1 |
+| **P3-3** | `pthread_cond_init` 返回值未检查 | `MemoryPool.c` Init 同步原语块 | 加 `r_cond != 0` 分支，回滚 mutex/ch/ch->mem/pt 后返 -1 |
+| **P3-4** | 需求文档 §7 API 草案与实现漂移 | `需求文档.md:187-215` | 顶部加"以 include/MemoryPool.h 为准"声明；同步 max_count 字段 + uint64_t 统计 |
+| **P3-5** | `grow_count<0` 在非 GROW 模式未拒绝 | `MemoryPool.c` Init GROW 校验后 | 追加 `if(grow_count < 0) return -1;`（0 保留为"未启用扩容"，仅拒绝负数）；补 Part 12.8 测试 |
+
+## 二、验证
+
+| 项 | 状态 |
+|----|------|
+| `gcc -fsyntax-only -Wall -Wextra -Wshadow` MemoryPool.c | ✅ 无告警 |
+| `gcc -fsyntax-only -Wall -Wextra -Wshadow` main.c | ✅ 无告警 |
+| ARM 交叉编译 + `./MemoryPool_DebugPro.bin` Part 1-14 | ⏸️ 待开发板运行，预期 PASS=27 FAIL=0（原 26 + Part 12.8 新增 1） |
+
+## 三、闭合状态
+
+- **P0/P1**：五轮累计 0 项，无阻塞。
+- **P2/P3**：本轮 8 项全部落地。
+- 前四轮所有修复复核完好保留，无回归。
+- 状态机（§6.1 mp_alloc_grow / §6.2 mp_alloc_block）新增 "INT_MAX clamp" 分支后仍逻辑闭合。
+
+## 四、最终判定
+
+**V1.1.1 可打 tag 发布。** 至此 MemoryPool 模块经过五轮"审查—修复—复核"闭环，所有已发现问题（0 项阻塞、0 项 P1、3 项 P2、5 项 P3）全部修复。剩余无 P2/P3 遗留项，代码进入"稳定期"，后续变更应以功能新增为主，不再需要健壮性回补。

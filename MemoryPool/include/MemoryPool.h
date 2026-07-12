@@ -127,7 +127,7 @@ typedef struct T_MEMPOOLSTATS
 {
     uint64_t      ulTotalAlloc;   /**< 累计 Alloc 成功次数 */
     uint64_t      ulTotalFree;    /**< 累计 Free 归还次数 */
-    uint64_t      ulTotalDrop;    /**< 累计返回NULL次数：DROP池满 + BLOCK超时 + GROW扩容失败 + GROW达 max_count 上限 */
+    uint64_t      ulTotalDrop;    /**< 累计返回NULL次数：DROP池满 + BLOCK超时 + GROW扩容失败 + GROW达 max_count 上限 + Destroy 唤醒时的 BLOCK 等待者 */
     uint64_t      ulTotalGrow;    /**< 累计 GROW 扩容槽位数（不含 init_count） */
     int           iPeakUsed;      /**< 峰值已用槽位数 */
     int           iCapacity;      /**< 总容量(含 GROW 扩容，槽位数) */
@@ -167,8 +167,9 @@ typedef struct T_MEMPOOLSTATS
  * @param[in]    name: 名称，调试日志用
  * @return       int ret
  * @retval       0:   初始化成功
- * @retval       -1:  参数无效、内存分配失败、*pp 非空、mode 非法、
- *                    GROW 模式 grow_count<=0、block_timeo<0 或乘法溢出
+ * @retval       -1:  参数无效（pp/name 为 NULL、*pp 非空）、mode 非法、
+ *                    GROW 模式 grow_count<=0、grow_count<0、block_timeo<0、
+ *                    element_size 越界、乘法溢出、内存分配失败或 pthread 原语初始化失败
  * @warning      pp 不能为 NULL，*pp 必须为 NULL
  * @author       zlzksrl
  * @date         2026-07-12

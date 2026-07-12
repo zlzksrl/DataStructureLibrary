@@ -165,10 +165,15 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
         return -1;
     }
 
-    /* ---- GROW 模式 grow_count 必须 >0 ---- */
+    /* ---- GROW 模式 grow_count 必须 >0；非 GROW 模式也拒绝负数（加严）---- */
     if(mode == MEMPOOL_MODE_GROW && grow_count <= 0)
     {
         printf("GROW mode need grow_count > 0 fail ##%s->%d\n", __FUNCTION__, __LINE__);
+        return -1;
+    }
+    if(grow_count < 0)
+    {
+        printf("grow_count %d < 0 fail ##%s->%d\n", grow_count, __FUNCTION__, __LINE__);
         return -1;
     }
     /* ---- mode 取值范围校验 ---- */
@@ -250,11 +255,23 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
     pt->waiter_count = 0;
     pt->shutting_down = 0;
 
-    pthread_mutex_init(&pt->mux, NULL);
+    /* ---- 同步原语初始化（返回值全部检查，失败则回滚已分配资源） ---- */
     {
-        /* cond 用 CLOCK_MONOTONIC，超时不受系统时间跳变影响 */
+        int r_mux, r_cond;
         pthread_condattr_t attr;
         int r_attr;
+
+        r_mux = pthread_mutex_init(&pt->mux, NULL);
+        if(r_mux != 0)
+        {
+            printf("pthread_mutex_init fail(%d) ##%s->%d\n", r_mux, __FUNCTION__, __LINE__);
+            free(ch->mem);
+            free(ch);
+            free(pt);
+            return -1;
+        }
+
+        /* cond 用 CLOCK_MONOTONIC，超时不受系统时间跳变影响 */
         pthread_condattr_init(&attr);
         r_attr = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
         if(r_attr != 0)
@@ -269,8 +286,17 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
             free(pt);
             return -1;
         }
-        pthread_cond_init(&pt->cond, &attr);
+        r_cond = pthread_cond_init(&pt->cond, &attr);
         pthread_condattr_destroy(&attr);
+        if(r_cond != 0)
+        {
+            printf("pthread_cond_init fail(%d) ##%s->%d\n", r_cond, __FUNCTION__, __LINE__);
+            pthread_mutex_destroy(&pt->mux);
+            free(ch->mem);
+            free(ch);
+            free(pt);
+            return -1;
+        }
     }
 
     /* 切槽位串入 free_list（Init 阶段单线程，无需加锁） */
@@ -316,7 +342,11 @@ int MemPoolAPI_Destroy(T_MemPool **pp)
         while(pt->waiter_count > 0)
         {
             /* 等待者退出时会 signal，Destroy 在此复用 cond 等待归零 */
-            pthread_cond_wait(&pt->cond, &pt->mux);
+            int r = pthread_cond_wait(&pt->cond, &pt->mux);
+            if(r != 0 && r != EINTR)   /* 极少发生的 EINVAL 等：避免 Destroy 死循环 */
+            {
+                break;
+            }
         }
     }
     pthread_mutex_unlock(&pt->mux);
@@ -402,6 +432,17 @@ static void *mp_alloc_grow(T_MemPool *p)
             {
                 this_grow = remain;   /* 只扩到上限，不越界 */
             }
+        }
+        /* ---- total_count 有符号溢出保护（无上限模式下防 INT_MAX） ---- */
+        if(this_grow > INT_MAX - p->total_count)
+        {
+            this_grow = INT_MAX - p->total_count;
+        }
+        if(this_grow <= 0)
+        {
+            p->total_drop++;
+            pthread_mutex_unlock(&p->mux);
+            return NULL;
         }
         if(mp_size_overflow(this_grow, p->align_size))
         {
