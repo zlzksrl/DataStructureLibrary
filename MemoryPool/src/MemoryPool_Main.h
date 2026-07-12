@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>    /* uint64_t */
+#include <limits.h>    /* INT_MAX */
 #include <pthread.h>
 #include <time.h>      /* clock_gettime / CLOCK_MONOTONIC */
 #include <errno.h>     /* ETIMEDOUT */
@@ -99,6 +101,7 @@ struct T_MEMPOOL
     MemPoolMode   mode;           /**< Alloc() 默认模式 */
     int           grow_count;     /**< GROW 每次扩容槽位数 */
     int           block_timeo;    /**< BLOCK 默认阻塞超时(ms)，0=无限 */
+    int           max_count;      /**< 总槽位上限；0=无上限（cfg.max_count<init_count 也视为无上限） */
 
     /* ---- 内存块链表 ---- */
     T_MemPoolChunk *chunks;       /**< 所有 chunk(初始 + GROW 扩容)，Destroy 时遍历释放 */
@@ -111,12 +114,14 @@ struct T_MEMPOOL
     /* ---- 同步 ---- */
     pthread_mutex_t mux;          /**< 互斥锁，保护 free_list 与所有字段 */
     pthread_cond_t  cond;         /**< 条件变量(BLOCK 模式)：Free 时 signal 唤醒等待者 */
+    int             waiter_count; /**< 当前 BLOCK 等待者数（Destroy 用来判断是否需 broadcast） */
+    int             shutting_down;/**< 关闭标志：Destroy 置 1 后 alloc_block 立即返 NULL */
 
-    /* ---- 统计 ---- */
-    unsigned long total_alloc;    /**< 累计 Alloc 成功次数 */
-    unsigned long total_free;     /**< 累计 Free 归还次数 */
-    unsigned long total_drop;     /**< 累计 DROP 丢弃次数(池满返回 NULL) */
-    unsigned long total_grow;     /**< 累计 GROW 扩容槽位数 */
+    /* ---- 统计（64 位，避免长时运行回绕） ---- */
+    uint64_t      total_alloc;    /**< 累计 Alloc 成功次数 */
+    uint64_t      total_free;     /**< 累计 Free 归还次数 */
+    uint64_t      total_drop;     /**< 累计 DROP 丢弃次数(池满/超时/扩容失败/达上限) */
+    uint64_t      total_grow;     /**< 累计 GROW 扩容槽位数 */
     int           peak_used;      /**< 峰值已用槽位数 */
 
     int           init_done;      /**< 初始化完成标志 0/1 */

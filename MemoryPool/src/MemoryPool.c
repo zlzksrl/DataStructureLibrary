@@ -29,10 +29,13 @@
 /**
  * @func         mp_align_up
  * @brief        将 size 向上补齐到 MEMPOOL_ALIGN 的倍数
+ * @details      用 unsigned 运算避免 size 接近 INT_MAX 时的有符号溢出（UB）。
+ *               调用方需保证 size > 0 且 size <= INT_MAX - MEMPOOL_ALIGN（Init 已校验）。
  */
 static int mp_align_up(int size)
 {
-    return (size + MEMPOOL_ALIGN - 1) / MEMPOOL_ALIGN * MEMPOOL_ALIGN;
+    unsigned int u = (unsigned int)size;
+    return (int)((u + MEMPOOL_ALIGN - 1u) / (unsigned int)MEMPOOL_ALIGN * (unsigned int)MEMPOOL_ALIGN);
 }
 
 /**
@@ -49,20 +52,17 @@ static int mp_size_overflow(int count, int align_size)
 /**
  * @func         mp_set_name
  * @brief        拷贝名称到固定缓冲（截断保护）
+ * @details      用 memcpy 而非 strncpy 避免 -Wstringop-truncation 告警，语义更清晰。
  */
 static void mp_set_name(char *dst, const char *src)
 {
     size_t len = strlen(src);
-    if(len < MAX_MEMORYPOOLNAME_LEN)
+    if(len > MAX_MEMORYPOOLNAME_LEN)
     {
-        strncpy(dst, src, len);
-        dst[len] = '\0';
+        len = MAX_MEMORYPOOLNAME_LEN;
     }
-    else
-    {
-        strncpy(dst, src, MAX_MEMORYPOOLNAME_LEN);
-        dst[MAX_MEMORYPOOLNAME_LEN] = '\0';
-    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
 }
 
 /**
@@ -85,12 +85,21 @@ static void mp_chunk_to_freelist(T_MemPool *p, T_MemPoolChunk *ch)
 /**
  * @func         mp_calc_deadline
  * @brief        计算条件变量绝对超时（CLOCK_MONOTONIC 当前时间 + ms 毫秒）
+ * @details      若 clock_gettime 失败，返回一个"已过期"的 ts（tv_sec=0），使
+ *               pthread_cond_timedwait 立即返回 ETIMEDOUT，走 stolen-wakeup 重判分支，
+ *               不会因未初始化的 ts 导致 EINVAL 忙等空转。
  */
 static void mp_calc_deadline(struct timespec *ts, int ms)
 {
     long add_ns;
     long nsec;
-    clock_gettime(CLOCK_MONOTONIC, ts);
+    if(clock_gettime(CLOCK_MONOTONIC, ts) != 0)
+    {
+        /* 时钟读取失败：构造一个过期的 ts，让 timedwait 立即返 ETIMEDOUT */
+        ts->tv_sec  = 0;
+        ts->tv_nsec = 0;
+        return;
+    }
     add_ns = (long)(ms % 1000) * 1000000L;
     nsec   = ts->tv_nsec + add_ns;
     ts->tv_sec  += ms / 1000 + nsec / 1000000000L;
@@ -119,7 +128,7 @@ static void mp_update_peak(T_MemPool *p)
  */
 int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name)
 {
-    int element_size, init_count, grow_count, block_timeo, align_size;
+    int element_size, init_count, grow_count, block_timeo, max_count, align_size;
     MemPoolMode mode;
     T_MemPool *pt;
     T_MemPoolChunk *ch;
@@ -147,6 +156,14 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
     mode         = cfg ? cfg->mode         : MEMPOOL_MODE_DROP;
     grow_count   = cfg ? cfg->grow_count   : 0;
     block_timeo  = cfg ? cfg->block_timeo  : 0;
+    max_count    = cfg ? cfg->max_count    : 0;
+
+    /* ---- element_size 上界校验（防 mp_align_up 内部溢出） ---- */
+    if(element_size > INT_MAX - MEMPOOL_ALIGN)
+    {
+        printf("element_size %d too large fail ##%s->%d\n", element_size, __FUNCTION__, __LINE__);
+        return -1;
+    }
 
     /* ---- GROW 模式 grow_count 必须 >0 ---- */
     if(mode == MEMPOOL_MODE_GROW && grow_count <= 0)
@@ -179,6 +196,12 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
     {
         printf("init_count*align_size overflow fail ##%s->%d\n", __FUNCTION__, __LINE__);
         return -1;
+    }
+
+    /* ---- max_count 归一化：<init_count(含<=0) 视为无上限(存 0)；否则原值 ---- */
+    if(max_count < init_count)
+    {
+        max_count = 0;   /* 0 内部约定=无上限 */
     }
 
     /* ---- 打印库版本 ---- */
@@ -219,17 +242,33 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
     pt->mode         = mode;
     pt->grow_count   = grow_count;
     pt->block_timeo  = block_timeo;
+    pt->max_count    = max_count;
     pt->chunks       = ch;
     pt->free_list    = NULL;
     pt->free_count   = 0;
     pt->total_count  = init_count;
+    pt->waiter_count = 0;
+    pt->shutting_down = 0;
 
     pthread_mutex_init(&pt->mux, NULL);
     {
         /* cond 用 CLOCK_MONOTONIC，超时不受系统时间跳变影响 */
         pthread_condattr_t attr;
+        int r_attr;
         pthread_condattr_init(&attr);
-        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        r_attr = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        if(r_attr != 0)
+        {
+            /* 极少发生：Linux 一直支持 CLOCK_MONOTONIC。清理并失败 */
+            printf("condattr_setclock CLOCK_MONOTONIC fail(%d) ##%s->%d\n",
+                   r_attr, __FUNCTION__, __LINE__);
+            pthread_condattr_destroy(&attr);
+            pthread_mutex_destroy(&pt->mux);
+            free(ch->mem);
+            free(ch);
+            free(pt);
+            return -1;
+        }
         pthread_cond_init(&pt->cond, &attr);
         pthread_condattr_destroy(&attr);
     }
@@ -247,8 +286,10 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
 /**
  * @func         MemPoolAPI_Destroy
  * @brief        销毁内存池，释放所有资源
- * @details      遍历 chunks 链表逐个释放(mem + 节点)，销毁 mutex/cond，释放结构体。
- *               幂等：*pp==NULL 返回 -1。
+ * @details      置 shutting_down 标志并 broadcast 唤醒所有 BLOCK 等待者，
+ *               等待它们全部退出（waiter_count 归零）后再释放资源，避免 UAF。
+ *               遍历 chunks 链表逐个释放(mem + 节点)，销毁 mutex/cond，释放结构体。
+ *               可重复调用：*pp==NULL 返回 -1。
  */
 int MemPoolAPI_Destroy(T_MemPool **pp)
 {
@@ -265,6 +306,21 @@ int MemPoolAPI_Destroy(T_MemPool **pp)
     }
 
     pt = *pp;
+
+    /* 通知所有 BLOCK 等待者退出，并等它们清干净后再释放 cond/mux */
+    pthread_mutex_lock(&pt->mux);
+    pt->shutting_down = 1;
+    if(pt->waiter_count > 0)
+    {
+        pthread_cond_broadcast(&pt->cond);
+        while(pt->waiter_count > 0)
+        {
+            /* 等待者退出时会 signal，Destroy 在此复用 cond 等待归零 */
+            pthread_cond_wait(&pt->cond, &pt->mux);
+        }
+    }
+    pthread_mutex_unlock(&pt->mux);
+
     /* 释放所有 chunk（含 GROW 扩容的） */
     ch = pt->chunks;
     while(ch != NULL)
@@ -310,6 +366,9 @@ static void *mp_alloc_drop(T_MemPool *p)
 /**
  * @func         mp_alloc_grow
  * @brief        内部-GROW 策略：池满则 malloc 新 chunk 扩容
+ * @details      max_count>0 时受总容量上限约束：
+ *               - 若 total_count 已达 max_count，直接 DROP 返回 NULL；
+ *               - 否则本次扩容槽位数 = min(grow_count, max_count - total_count)，尽量填满。
  */
 static void *mp_alloc_grow(T_MemPool *p)
 {
@@ -320,13 +379,31 @@ static void *mp_alloc_grow(T_MemPool *p)
     {
         /* 扩容 */
         T_MemPoolChunk *ch;
+        int this_grow;
         if(p->grow_count <= 0)
         {
             p->total_drop++;
             pthread_mutex_unlock(&p->mux);
             return NULL;
         }
-        if(mp_size_overflow(p->grow_count, p->align_size))
+        /* ---- max_count 上限约束 ---- */
+        this_grow = p->grow_count;
+        if(p->max_count > 0)
+        {
+            int remain = p->max_count - p->total_count;
+            if(remain <= 0)
+            {
+                /* 到达上限：GROW 自动退化为 DROP */
+                p->total_drop++;
+                pthread_mutex_unlock(&p->mux);
+                return NULL;
+            }
+            if(this_grow > remain)
+            {
+                this_grow = remain;   /* 只扩到上限，不越界 */
+            }
+        }
+        if(mp_size_overflow(this_grow, p->align_size))
         {
             p->total_drop++;
             pthread_mutex_unlock(&p->mux);
@@ -339,7 +416,7 @@ static void *mp_alloc_grow(T_MemPool *p)
             pthread_mutex_unlock(&p->mux);
             return NULL;
         }
-        ch->mem = (unsigned char *)malloc((size_t)p->grow_count * (size_t)p->align_size);
+        ch->mem = (unsigned char *)malloc((size_t)this_grow * (size_t)p->align_size);
         if(ch->mem == NULL)
         {
             free(ch);
@@ -347,12 +424,12 @@ static void *mp_alloc_grow(T_MemPool *p)
             pthread_mutex_unlock(&p->mux);
             return NULL;
         }
-        ch->count = p->grow_count;
+        ch->count = this_grow;
         ch->next  = p->chunks;
         p->chunks = ch;
         mp_chunk_to_freelist(p, ch);          /* 切槽串入 free_list */
         p->total_count += ch->count;
-        p->total_grow  += (unsigned long)ch->count;
+        p->total_grow  += (uint64_t)ch->count;
         slot = p->free_list;
     }
     p->free_list = *(void **)slot;
@@ -366,6 +443,10 @@ static void *mp_alloc_grow(T_MemPool *p)
 /**
  * @func         mp_alloc_block
  * @brief        内部-BLOCK 策略：池满阻塞等 Free 归还（timeo=0 无限，>0 超时返 NULL）
+ * @details      - 进入等待前登记 waiter_count，退出时递减并 signal 让 Destroy 感知；
+ *               - 检测 shutting_down，Destroy 中途会 broadcast，等待者立即返回 NULL；
+ *               - 无限等待与带超时分支都对 cond_wait/timedwait 的非 0 非 EINTR 返回值
+ *                 做兜底（如极少见的 EINVAL），避免忙等空转。
  */
 static void *mp_alloc_block(T_MemPool *p, int timeo)
 {
@@ -375,12 +456,33 @@ static void *mp_alloc_block(T_MemPool *p, int timeo)
         return NULL;
     }
     pthread_mutex_lock(&p->mux);
+
+    /* Destroy 已启动：直接失败 */
+    if(p->shutting_down)
+    {
+        p->total_drop++;
+        pthread_mutex_unlock(&p->mux);
+        return NULL;
+    }
+
+    p->waiter_count++;
     if(timeo == 0)
     {
         /* 无限等待 */
-        while(p->free_list == NULL)
+        while(p->free_list == NULL && !p->shutting_down)
         {
-            pthread_cond_wait(&p->cond, &p->mux);
+            int r = pthread_cond_wait(&p->cond, &p->mux);
+            if(r != 0 && r != EINTR)   /* 对齐 timedwait 分支：非法状态兜底避免忙等 */
+            {
+                p->total_drop++;
+                p->waiter_count--;
+                if(p->shutting_down && p->waiter_count == 0)
+                {
+                    pthread_cond_signal(&p->cond);
+                }
+                pthread_mutex_unlock(&p->mux);
+                return NULL;
+            }
         }
     }
     else
@@ -388,7 +490,7 @@ static void *mp_alloc_block(T_MemPool *p, int timeo)
         /* 带超时 */
         struct timespec ts;
         mp_calc_deadline(&ts, timeo);
-        while(p->free_list == NULL)
+        while(p->free_list == NULL && !p->shutting_down)
         {
             int r = pthread_cond_timedwait(&p->cond, &p->mux, &ts);
             if(r == ETIMEDOUT)
@@ -397,6 +499,11 @@ static void *mp_alloc_block(T_MemPool *p, int timeo)
                 if(p->free_list == NULL)
                 {
                     p->total_drop++;      /* 确实超时无槽位 */
+                    p->waiter_count--;
+                    if(p->shutting_down && p->waiter_count == 0)
+                    {
+                        pthread_cond_signal(&p->cond);
+                    }
                     pthread_mutex_unlock(&p->mux);
                     return NULL;
                 }
@@ -405,11 +512,31 @@ static void *mp_alloc_block(T_MemPool *p, int timeo)
             else if(r != 0 && r != EINTR)  /* 非 ETIMEDOUT/EINTR 的意外错误：避免忙等空转 */
             {
                 p->total_drop++;
+                p->waiter_count--;
+                if(p->shutting_down && p->waiter_count == 0)
+                {
+                    pthread_cond_signal(&p->cond);
+                }
                 pthread_mutex_unlock(&p->mux);
                 return NULL;
             }
         }
     }
+
+    /* shutting_down 唤醒路径：立即返回 NULL */
+    if(p->shutting_down)
+    {
+        p->total_drop++;
+        p->waiter_count--;
+        if(p->waiter_count == 0)
+        {
+            pthread_cond_signal(&p->cond);   /* 唤醒 Destroy */
+        }
+        pthread_mutex_unlock(&p->mux);
+        return NULL;
+    }
+
+    p->waiter_count--;
     slot = p->free_list;
     p->free_list = *(void **)slot;
     p->free_count--;
@@ -499,7 +626,10 @@ int MemPoolAPI_Free(T_MemPool *p, void *elem)
     p->free_list = elem;             /* 本槽位变新链头 */
     p->free_count++;
     p->total_free++;
-    pthread_cond_signal(&p->cond);   /* 唤醒一个 BLOCK 等待者 */
+    if(p->waiter_count > 0)          /* 有等待者才 signal，无谓开销 */
+    {
+        pthread_cond_signal(&p->cond);
+    }
     pthread_mutex_unlock(&p->mux);
     return 0;
 }
