@@ -36,6 +36,7 @@
 #include <dirent.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 /* 公共头 */
 #include "../include/FileWriter.h"
@@ -59,6 +60,8 @@
 #define FW_DEFAULT_FLUSH_BYTES      4096
 #define FW_DEFAULT_FLUSH_MS         100
 #define FW_DEFAULT_THREAD_PRIORITY  20
+#define FW_DEFAULT_DESTROY_WAIT_MS  500     /* Destroy 等 in-flight Writer 出保护区的默认超时 */
+#define FW_DESTROY_POLL_US          100     /* Destroy spin-wait 的轮询步长(us) */
 
 
 /* ================================================================== */
@@ -102,6 +105,14 @@ struct T_FILEWRITER
     pthread_t           thread_id;                         /**< 消费线程 ID（ThreadManage 创建） */
     volatile int        thread_running;                    /**< 线程运行标志 0/1（跨线程访问，volatile） */
     volatile int        shutting_down;                     /**< 关闭标志（Destroy 时置 1，通知线程退出） */
+
+    /* ---- 抗并发销毁（原子字段，无锁访问） ---- */
+    atomic_int          ref_count;                         /**< 正在保护区的 Writer 数（含查询/Rotate/Flush）。
+                                                                Write 入保护区 fetch_add(1)，出保护区 fetch_sub(1)。
+                                                                Init 时初始化为 0（消费线程不计）。 */
+    atomic_int          destroying;                        /**< Destroy 已开始，新的保护区进入应拒绝 */
+    atomic_int          destroy_pending;                   /**< Phase B：Destroy 已超时放弃等待，
+                                                                最后一个出保护区的 Writer 负责最终 free */
 
     /* ---- 统计信息（受 file_lock 保护） ---- */
     unsigned long       stat_bytes_written;                /**< 累计已写盘字节数（fwrite 成功计数） */

@@ -64,12 +64,14 @@ LDFLAGS := $(LDFLAGS)  -lThreadManage
 # 库源文件（位于 ../src/ 目录）
 SOURCES     = FileWriter.c
 # 测试主程序源文件（位于当前目录）
-MAIN_SOURCE = main.c
+MAIN_SOURCE   = main.c
+STRESS_SOURCE = stress_test.c
 
 # 目标文件（分离静态库和动态库的 .o 文件，避免 -fPIC 混用）
 STATIC_OBJS = $(addprefix obj_static/,$(notdir $(SOURCES:.c=.o)))
 SHARED_OBJS = $(addprefix obj_shared/,$(notdir $(SOURCES:.c=.o)))
 MAIN_OBJ    = $(MAIN_SOURCE:.c=.o)
+STRESS_OBJ  = $(STRESS_SOURCE:.c=.o)
 
 # ==============================================================================
 # 输出文件
@@ -81,6 +83,7 @@ SHARED_LIBNAME = lib$(TARGET_Name).so
 # 可执行文件（带日期戳的版本和默认版本）
 TARGET_DATE    = $(TARGET_Name)_DebugPro$(shell date "+%Y%m%d").bin
 TARGET         = $(TARGET_Name)_DebugPro.bin
+STRESS_TARGET  = $(TARGET_Name)_Stress.bin
 
 # 自动生成的头文件（包含编译时间戳信息）
 TARGET_MAKETIME_H  = ./../src/$(TARGET_Name)_Maketime.h
@@ -105,10 +108,10 @@ MAKETIME_FILE := $(shell echo "\#endif"                                        >
 # ==============================================================================
 # 伪目标声明
 # ==============================================================================
-.PHONY: all clean install install_lib slib dlib app
+.PHONY: all clean install install_lib slib dlib app stress
 
 # ---- 默认目标: 构建静态库、动态库、可执行程序 ----
-all: slib dlib app
+all: slib dlib app stress
 	# 生成工程信息文件（包含库文件 MD5 校验和）
 	echo "PROJECT_MAKETIME $(USERNAME)-$(ProgramVER) at $(MAKETIME) $(STATIC_LIBNAME)" >  $(PROJECT_INFO)
 	md5sum $(STATIC_LIBNAME) >> $(PROJECT_INFO)
@@ -157,6 +160,16 @@ $(MAIN_OBJ): $(MAIN_SOURCE)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ==============================================================================
+# ---- 高压测试程序（抗并发销毁）----
+# ==============================================================================
+stress: $(STATIC_LIBNAME) $(STRESS_OBJ)
+	$(CC) $(CFLAGS) -o $(STRESS_TARGET) $(STRESS_OBJ) $(STATIC_LIBNAME) $(LDFLAGS)
+	@chmod 755 $(STRESS_TARGET)
+
+$(STRESS_OBJ): $(STRESS_SOURCE)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# ==============================================================================
 # ---- 清理目标 ----
 clean:
 	rm -f *.bin -rf
@@ -164,12 +177,13 @@ clean:
 	rm -f obj_shared/*.o obj_shared/ -rf
 	rm -f obj_static/*.o obj_static/ -rf
 	rm -f $(STATIC_LIBNAME) $(SHARED_LIBNAME)
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(STRESS_TARGET)
 	rm -f $(PROJECT_INFO)
+	rm -rf ./stress_test ./fw_test
 
 # ---- 安装可执行文件到目标开发板（通过 scp） ----
 install:
-	scp $(TARGET) $(INSTALLBOARD);
+	scp *.bin $(INSTALLBOARD);
 
 # ---- 安装库文件到本地公共库目录 ----
 install_lib:slib dlib

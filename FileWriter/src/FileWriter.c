@@ -54,6 +54,55 @@ static int  fw_date_changed_locked(T_FileWriter *fw);
 /* ---- 消费线程 ---- */
 static void *fw_consumer_thread(void *arg);
 
+/* ---- 抗并发销毁（Phase B：最终释放） ---- */
+static void fw_final_free(T_FileWriter *fw);
+
+
+/* ========================== 抗并发销毁：入/出保护区宏 ========================== */
+
+/**
+ * @brief  Writer 进入保护区（Write/WriteBin/Flush/Rotate/查询/StatsGet 都走这里）
+ * @param  fw   FileWriter 句柄
+ * @param  err  失败时函数应返回的值（如 -1 / -2）
+ *
+ * 流程：
+ *   1. 快速检查 destroying —— Destroy 已开始，直接拒绝，不入保护区；
+ *   2. fetch_add(ref_count, 1) 占位；
+ *   3. 再次检查 destroying —— 若在 1) 与 2) 之间 Destroy 到来，
+ *      回滚 ref_count 并可能触发 Phase B 兜底释放。
+ *
+ * memory_order 说明：
+ *   - fetch_add(acq_rel) 保证后续读到的 fw->sb/fp 是 Init 之后的可见值；
+ *   - 检查 destroying 用 acquire，保证 Destroy 侧 release 的所有 store 可见。
+ */
+#define FW_ENTER_GUARD(fw, err) \
+    do { \
+        if(atomic_load_explicit(&(fw)->destroying, memory_order_acquire)) return (err); \
+        atomic_fetch_add_explicit(&(fw)->ref_count, 1, memory_order_acq_rel); \
+        if(atomic_load_explicit(&(fw)->destroying, memory_order_acquire)) { \
+            int _r = atomic_fetch_sub_explicit(&(fw)->ref_count, 1, memory_order_acq_rel); \
+            if(_r == 1 && atomic_load_explicit(&(fw)->destroy_pending, memory_order_acquire)) { \
+                fw_final_free(fw); \
+            } \
+            return (err); \
+        } \
+    } while(0)
+
+/**
+ * @brief  Writer 出保护区
+ *
+ * 若我是最后一个引用（fetch_sub 返回 1）且 destroy_pending 已置位，
+ * 由我负责 Phase B 的最终释放（fw_final_free 内部会 destroy SB / mutex / free）。
+ * 释放后 fw 指针不可再访问，所以本宏应放在函数 return 之前的最后一步。
+ */
+#define FW_LEAVE_GUARD(fw) \
+    do { \
+        int _r = atomic_fetch_sub_explicit(&(fw)->ref_count, 1, memory_order_acq_rel); \
+        if(_r == 1 && atomic_load_explicit(&(fw)->destroy_pending, memory_order_acquire)) { \
+            fw_final_free(fw); \
+        } \
+    } while(0)
+
 
 /* ========================== 内部辅助函数 ========================== */
 
@@ -766,6 +815,11 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
         return -1;
     }
 
+    /* 抗并发销毁：原子字段初始化。memset 已置 0，此处显式化以求可读。 */
+    atomic_init(&pt->ref_count, 0);
+    atomic_init(&pt->destroying, 0);
+    atomic_init(&pt->destroy_pending, 0);
+
     /* 初始日期 & 序号 */
     fw_get_date_str(pt->current_date, sizeof(pt->current_date));
     pt->file_seq = 0;
@@ -863,9 +917,43 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     return 0;
 }
 
+/**
+ * @func         fw_final_free
+ * @brief        释放 FileWriter 结构本体（SB + mutex + 结构体）
+ * @details      两处调用点：
+ *               1. FileWriterAPI_Destroy 的 Phase A（ref_count 归 0 时）；
+ *               2. FW_LEAVE_GUARD 中最后一个 Writer 出保护区、且 destroy_pending=1 时
+ *                  （Phase B，Destroy 已放弃等待、当前 Writer 兜底）。
+ *
+ *               调用前提：Destroy 的同步阶段（消费线程 join、fclose 数据完整落盘）
+ *               已经完成。本函数只做"内存资源"层面的最终释放，不涉及文件 I/O。
+ *
+ *               释放后 fw 指针不可再访问。
+ */
+static void fw_final_free(T_FileWriter *fw)
+{
+    if(NULL == fw)
+    {
+        return;
+    }
+    /* SB 已在 Destroy 的 Phase A 中调过 Close；此处 Destroy 释放内存。
+     * 此时 ref_count 已归 0（Phase A）或即将归 0（Phase B 走到这里）——
+     * 无并发访问 fw->sb 的可能。 */
+    if(fw->sb != NULL)
+    {
+        StreamBufferAPI_Destroy(&fw->sb);
+    }
+    pthread_mutex_destroy(&fw->file_lock);
+    fw->init_done = 0;
+    free(fw);
+}
+
 int FileWriterAPI_Destroy(T_FileWriter **pp)
 {
     T_FileWriter *pt;
+    int wait_ms;
+    int elapsed_us;
+    int ref_left;
 
     if(NULL == pp || NULL == *pp)
     {
@@ -878,18 +966,26 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
 
     pt = *pp;
 
-    /* 1. 阻止新写入 */
+    /* ============ Phase A：同步阶段 ============ */
+
+    /* A1. 原子置 destroying=1（release 顺序）：
+     *     配合 FW_ENTER_GUARD 的 acquire load，保证后续入保护区的 Writer 会看到并被拒绝。
+     *     已在保护区内的 Writer 继续执行完当前调用，然后在 LEAVE_GUARD 中 -1。 */
+    atomic_store_explicit(&pt->destroying, 1, memory_order_release);
+
+    /* A2. 阻止新写入进入 SB（此时若有 Writer 在 Write 内部已通过 GUARD、正在调 PutData，
+     *     SB 的 Close 会让 PutData 返回 -2，或者 PutData 已在拷贝阶段——SB 内部有锁保护）。 */
     StreamBufferAPI_Close(pt->sb);
 
-    /* 2. 通知消费线程排空后退出（thread_running 只是软标志，实际靠 CLOSE_EMPTY） */
+    /* A3. 通知消费线程排空后退出 */
     pt->shutting_down  = 1;
     pt->thread_running = 0;
-    StreamBufferAPI_Flush(pt->sb);  /* 唤醒 Wait */
+    StreamBufferAPI_Flush(pt->sb);
 
-    /* 3. 等线程退出（排空 + fclose 在线程内完成） */
+    /* A4. 等消费线程排空并退出（线程内 fflush+fclose，数据完整落盘） */
     pthread_join(pt->thread_id, NULL);
 
-    /* 4. 兜底：线程内已 fclose，这里再检查一次 */
+    /* A5. 兜底：消费线程内已 fclose，此处防御性再检查一次 */
     pthread_mutex_lock(&pt->file_lock);
     if(pt->fp != NULL)
     {
@@ -899,13 +995,51 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
     }
     pthread_mutex_unlock(&pt->file_lock);
 
-    /* 5. 销毁 StreamBuffer */
-    StreamBufferAPI_Destroy(&pt->sb);
+    /* A6. 等所有 in-flight Writer 出保护区（超时 destroy_wait_ms） */
+    wait_ms = (pt->config.destroy_wait_ms > 0)
+              ? pt->config.destroy_wait_ms : FW_DEFAULT_DESTROY_WAIT_MS;
 
-    /* 6. 销毁锁、释放结构体 */
-    pthread_mutex_destroy(&pt->file_lock);
-    pt->init_done = 0;
-    free(pt);
+    elapsed_us = 0;
+    while(atomic_load_explicit(&pt->ref_count, memory_order_acquire) > 0)
+    {
+        usleep(FW_DESTROY_POLL_US);
+        elapsed_us += FW_DESTROY_POLL_US;
+        if(elapsed_us >= wait_ms * 1000)
+        {
+            break;
+        }
+    }
+
+    /* A7. 归零：干净路径，直接释放 */
+    ref_left = atomic_load_explicit(&pt->ref_count, memory_order_acquire);
+    if(0 == ref_left)
+    {
+        *pp = NULL;
+        fw_final_free(pt);
+        return 0;
+    }
+
+    /* ============ Phase B：延迟释放 ============ */
+
+    /* B1. 置 destroy_pending=1（release），保证 Writer 侧后续 acquire load 能看到 */
+    atomic_store_explicit(&pt->destroy_pending, 1, memory_order_release);
+
+    /* B2. 再检查一次：可能在 A7 判断后、置 destroy_pending 前，
+     *     Writer 已经完成 fetch_sub 归 0——若我们不检查，就没人兜底了。
+     *     此时应由本函数直接兜底释放。 */
+    ref_left = atomic_load_explicit(&pt->ref_count, memory_order_acquire);
+    if(0 == ref_left)
+    {
+        *pp = NULL;
+        fw_final_free(pt);
+        return 0;
+    }
+
+    /* B3. 交给最后一个出保护区的 Writer 兜底。
+     *     文件数据已在 A4 落盘，实例内存延迟释放，业务视角 *pp=NULL 已"归还"。 */
+    printf("FileWriter [%s] destroy deferred: %d writer(s) still in flight, "
+           "will free when last exits ##%s->%d\n",
+           pt->name, ref_left, __FUNCTION__, __LINE__);
     *pp = NULL;
     return 0;
 }
@@ -922,12 +1056,16 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
     int offset = 0;    /* 时间戳前缀长度（若开启） */
     int n;             /* vsnprintf 返回值 */
     int fmt_len;
+    int ret;
     va_list ap;
 
     if(NULL == fw || NULL == fmt || !fw->init_done)
     {
         return -1;
     }
+
+    /* 抗并发销毁：进保护区。Destroy 已开始则返回 -2（语义同 SB 已关闭） */
+    FW_ENTER_GUARD(fw, -2);
 
     /* 时间戳前缀 [HH:MM:SS.mmmmmm] （config.timestamp==1 时开启） */
     if(fw->config.timestamp)
@@ -944,6 +1082,7 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
     if(n < 0)
     {
         /* vsnprintf 遇编码错误极少发生；出现即视为参数无效 */
+        FW_LEAVE_GUARD(fw);
         return -1;
     }
     /* 超长时截断到 buffer 末尾（不含末尾 '\0'），仅丢内容不越界 */
@@ -955,11 +1094,16 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
 
     /* 入队（StreamBuffer 内部 memcpy，返回后 buf 可复用/释放）。
      * PutData 返回值：>=0 入队字节数；-1 参数无效；-2 已关闭；-3 缓冲满丢弃。 */
-    return StreamBufferAPI_PutData(fw->sb, buf, fmt_len);
+    ret = StreamBufferAPI_PutData(fw->sb, buf, fmt_len);
+
+    FW_LEAVE_GUARD(fw);
+    return ret;
 }
 
 int FileWriterAPI_WriteBin(T_FileWriter *fw, const void *data, int len)
 {
+    int ret;
+
     if(NULL == fw || NULL == data || !fw->init_done)
     {
         return -1;
@@ -968,7 +1112,11 @@ int FileWriterAPI_WriteBin(T_FileWriter *fw, const void *data, int len)
     {
         return -1;
     }
-    return StreamBufferAPI_PutData(fw->sb, (const char *)data, len);
+
+    FW_ENTER_GUARD(fw, -2);
+    ret = StreamBufferAPI_PutData(fw->sb, (const char *)data, len);
+    FW_LEAVE_GUARD(fw);
+    return ret;
 }
 
 
@@ -983,20 +1131,27 @@ int FileWriterAPI_Rotate(T_FileWriter *fw)
         return -1;
     }
 
+    FW_ENTER_GUARD(fw, -1);
     /* Rotate 需要与消费线程互斥（消费线程写盘可能同时进行） */
     pthread_mutex_lock(&fw->file_lock);
     ret = fw_rotate_locked(fw);
     pthread_mutex_unlock(&fw->file_lock);
+    FW_LEAVE_GUARD(fw);
     return ret;
 }
 
 int FileWriterAPI_Flush(T_FileWriter *fw)
 {
+    int ret;
+
     if(NULL == fw || !fw->init_done)
     {
         return -1;
     }
-    return StreamBufferAPI_Flush(fw->sb);
+    FW_ENTER_GUARD(fw, -1);
+    ret = StreamBufferAPI_Flush(fw->sb);
+    FW_LEAVE_GUARD(fw);
+    return ret;
 }
 
 
@@ -1008,10 +1163,12 @@ int FileWriterAPI_GetCurrentFileName(T_FileWriter *fw, char *out, int out_len)
     {
         return -1;
     }
+    FW_ENTER_GUARD(fw, -1);
     pthread_mutex_lock(&fw->file_lock);
     strncpy(out, fw->current_filename, out_len - 1);
     out[out_len - 1] = '\0';
     pthread_mutex_unlock(&fw->file_lock);
+    FW_LEAVE_GUARD(fw);
     return 0;
 }
 
@@ -1021,10 +1178,12 @@ int FileWriterAPI_GetCurrentFilePath(T_FileWriter *fw, char *out, int out_len)
     {
         return -1;
     }
+    FW_ENTER_GUARD(fw, -1);
     pthread_mutex_lock(&fw->file_lock);
     strncpy(out, fw->current_filepath, out_len - 1);
     out[out_len - 1] = '\0';
     pthread_mutex_unlock(&fw->file_lock);
+    FW_LEAVE_GUARD(fw);
     return 0;
 }
 
@@ -1034,10 +1193,12 @@ int FileWriterAPI_GetCurrentDirPath(T_FileWriter *fw, char *out, int out_len)
     {
         return -1;
     }
+    FW_ENTER_GUARD(fw, -1);
     pthread_mutex_lock(&fw->file_lock);
     strncpy(out, fw->current_dirpath, out_len - 1);
     out[out_len - 1] = '\0';
     pthread_mutex_unlock(&fw->file_lock);
+    FW_LEAVE_GUARD(fw);
     return 0;
 }
 
@@ -1056,6 +1217,8 @@ int FileWriterAPI_GetFileCount(T_FileWriter *fw)
         return -1;
     }
 
+    FW_ENTER_GUARD(fw, -1);
+
     /* 快照当前目录 */
     pthread_mutex_lock(&fw->file_lock);
     strncpy(dirpath, fw->current_dirpath, sizeof(dirpath) - 1);
@@ -1069,6 +1232,7 @@ int FileWriterAPI_GetFileCount(T_FileWriter *fw)
     dir = opendir(dirpath);
     if(NULL == dir)
     {
+        FW_LEAVE_GUARD(fw);
         return -1;
     }
 
@@ -1085,6 +1249,7 @@ int FileWriterAPI_GetFileCount(T_FileWriter *fw)
         }
     }
     closedir(dir);
+    FW_LEAVE_GUARD(fw);
     return count;
 }
 
@@ -1100,6 +1265,8 @@ int FileWriterAPI_GetTotalFileCount(T_FileWriter *fw)
         return -1;
     }
 
+    FW_ENTER_GUARD(fw, -1);
+
     pthread_mutex_lock(&fw->file_lock);
     strncpy(dirpath, fw->current_dirpath, sizeof(dirpath) - 1);
     dirpath[sizeof(dirpath) - 1] = '\0';
@@ -1108,6 +1275,7 @@ int FileWriterAPI_GetTotalFileCount(T_FileWriter *fw)
     dir = opendir(dirpath);
     if(NULL == dir)
     {
+        FW_LEAVE_GUARD(fw);
         return -1;
     }
 
@@ -1120,6 +1288,7 @@ int FileWriterAPI_GetTotalFileCount(T_FileWriter *fw)
         count++;
     }
     closedir(dir);
+    FW_LEAVE_GUARD(fw);
     return count;
 }
 
@@ -1133,11 +1302,16 @@ int FileWriterAPI_StatsGet(T_FileWriter *fw, T_FileWriterStats *out)
         return -1;
     }
 
+    FW_ENTER_GUARD(fw, -1);
+
     /* SB used 和 file_count 不持 file_lock 也能拿；且必须在拿 file_lock 前取，
      * 避免锁嵌套：
      * - StreamBufferAPI_GetLength 内部持 SB 自己的锁；
      * - FileWriterAPI_GetFileCount 内部会拿 file_lock 快照目录路径。
-     * 若这里已持 file_lock 再调 GetFileCount，会自锁死锁。 */
+     * 若这里已持 file_lock 再调 GetFileCount，会自锁死锁。
+     *
+     * 注：GetFileCount 也会走 FW_ENTER_GUARD 再 +1，形成瞬时 ref_count=2，
+     * 属于同一线程重入，无死锁；Destroy 侧 spin-wait 只关心归 0，重入正常出栈时会 -2 归位。 */
     sb_used    = StreamBufferAPI_GetLength(fw->sb);
     file_count = FileWriterAPI_GetFileCount(fw);
 
@@ -1152,6 +1326,8 @@ int FileWriterAPI_StatsGet(T_FileWriter *fw, T_FileWriterStats *out)
     /* 负值兜底：SB/文件系统 API 返回 -1 表示查询失败，对用户呈 0 更合理 */
     out->sb_used    = (sb_used    >= 0) ? sb_used    : 0;
     out->file_count = (file_count >= 0) ? file_count : 0;
+
+    FW_LEAVE_GUARD(fw);
     return 0;
 }
 

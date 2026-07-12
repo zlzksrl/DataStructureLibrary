@@ -142,6 +142,11 @@ typedef struct T_FILEWRITERCONFIG
     int      flush_bytes;            /**< 攒批字节阈值(如 4096)，达此值触发写盘 */
     int      flush_ms;               /**< 定时写盘周期(ms，如 100) */
     int      buffer_capacity;        /**< StreamBuffer 容量(字节，须2的幂，如65536) */
+
+    /* ---- 生命周期 ---- */
+    int      destroy_wait_ms;        /**< Destroy 等 in-flight Writer 出保护区的超时(ms)，<=0=默认 500ms。
+                                          超时后 Destroy 返回，实例内存延迟到最后一个 Writer 退出时释放，
+                                          文件数据已在同步阶段完整落盘。 */
 } T_FileWriterConfig;
 
 
@@ -176,23 +181,32 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg);
 /**
  * @func         FileWriterAPI_Destroy
  * @brief        FileWriterAPI-销毁实例（一步到位：优雅关闭 + 释放资源）
- * @details      依次执行：
- *               1. StreamBuffer.Close（阻止新写入）
- *               2. 消费线程排空缓冲（全部 fwrite 落盘）
- *               3. fflush + fclose 文件
- *               4. 线程退出（ThreadManage）
- *               5. Destroy StreamBuffer
- *               6. free 结构体，*pp = NULL
- *               返回后保证文件数据完整，所有资源释放。
+ * @details      抗并发销毁设计（**允许与 Write/WriteBin/Flush/Rotate/查询并发**）：
+ *
+ *               Phase A（同步阶段，Destroy 内完成，本函数返回时保证已完成）：
+ *                 1. 设置 destroying=1（原子），阻止新的 Write 进入保护区；
+ *                 2. StreamBuffer.Close 阻止新入队；
+ *                 3. Flush 唤醒消费线程 → join 消费线程；
+ *                 4. 消费线程内 fflush + fclose，数据完整落盘；
+ *                 5. 等所有 in-flight Writer 出保护区（超时 destroy_wait_ms，默认 500ms）；
+ *                 6. 若 ref_count 已归 0：Destroy StreamBuffer + free 结构体 + *pp=NULL；
+ *
+ *               Phase B（异步阶段，仅在 Phase A 超时未归零时进入）：
+ *                 - 置 destroy_pending=1，*pp=NULL（用户视角句柄已归还）；
+ *                 - 最后一个出保护区的 Writer 检测到 destroy_pending，
+ *                   自行完成 StreamBufferAPI_Destroy + free；
+ *                 - 极端情况（业务线程永挂）实例内存泄漏几 KB，**保证不 UAF**。
+ *
+ *               任何情况下：本函数**有界返回**（最长 destroy_wait_ms ± 消费线程 drain 时长）。
  * @param[in]    pp: 句柄二级指针
  * @return       int ret
- * @retval       0:   销毁成功（数据完整落盘）
+ * @retval       0:   销毁完成（Phase A 干净释放，或 Phase B 已启动，数据都已完整落盘）
  * @retval       -1:  参数无效或 *pp 已为 NULL
- * @warning      调用前必须确保所有业务线程已停止调用 Write/WriteBin/Flush/Rotate/查询接口，
- *               本函数与写入/查询并发不安全（由调用者负责生命周期同步）。
+ * @note         Phase B 启动次数可从 T_FileWriterStats（如需扩展）或库日志观察；
+ *               通常业务线程 Write 都是短操作，Phase A 5-50ms 内归零。
  * @author       zlzksrl
- * @date         2026-07-11
- * @Version      V1.0.0
+ * @date         2026-07-12
+ * @Version      V1.1.0
  */
 int FileWriterAPI_Destroy(T_FileWriter **pp);
 
