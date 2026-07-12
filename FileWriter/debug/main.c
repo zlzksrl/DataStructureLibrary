@@ -1,15 +1,17 @@
 /**
  * @file        main.c
  * @brief       FileWriter 异步文件写入 - 测试/演示程序
- * @details     覆盖需求文档"典型应用"的四类场景：
+ * @details     覆盖需求文档"典型应用"及 API 全表面，分 7 段用例：
  *
- *              Part 1: 异步日志 (LOG) —— printf 式格式化 + 时间戳前缀
- *              Part 2: CSV 记录     —— 表头 + 多列数据（无时间戳）
- *              Part 3: 二进制 BIN   —— WriteBin 原样入队（无时间戳、无格式化）
- *              Part 4: 多实例       —— 一个进程 Init 多个 FileWriter，独立线程写盘
- *              Part 5: 手动轮转     —— Rotate() 生成新文件，max_files 限制生效
- *              Part 6: 查询接口     —— GetCurrentFileName/Path/DirPath/FileCount
- *              Part 7: 工具函数     —— GetTimeString / MakeDirs
+ *              Part 1: 异步日志 (LOG)  —— printf 式格式化 + 时间戳前缀
+ *              Part 2: CSV 记录        —— 含子路径 file_prefix + 表头 + 多列数据（无时间戳）
+ *              Part 3: 二进制 BIN      —— WriteBin 原样入队 + max_file_size 触发轮转
+ *              Part 4: 多实例          —— 一个进程 Init 多个 FileWriter，独立线程写盘
+ *              Part 5: 手动轮转        —— Rotate() 生成新文件，max_files 限制生效
+ *              Part 6: 查询接口 + Stats —— GetCurrentFileName/Path/DirPath + StatsGet
+ *              Part 7: 工具函数        —— GetTimeString / MakeDirs
+ *
+ *              所有输出集中在 ./fw_test/ 下（见 TEST_ROOT 目录树注释）。
  *
  * @author      zlzksrl
  * @Version     V1.0.0

@@ -579,11 +579,19 @@ static int fw_check_daily_rotate_locked(T_FileWriter *fw)
 /**
  * @func         fw_consumer_thread
  * @brief        消费线程：Wait→GetData→fwrite→fflush，处理轮转/关闭
- * @details      循环:
- *               1. Wait(flush_ms)
- *               2. 拿锁 → 跨日检查 → 循环 GetData → fwrite → fflush → 大小轮转 → 放锁
- *               3. 若 Wait 返回 CLOSE_EMPTY，说明关闭且缓冲已空，退出
- *               4. shutting_down 且 used==0 时兜底退出
+ * @details      主循环:
+ *               1. Wait(flush_ms)   —— 等待触发条件(阈值/超时/Flush/Close)
+ *               2. 若 used>0 或 r>0（有数据）：
+ *                    加锁 → 跨日检查 → 循环 GetData→fwrite→fflush → 大小轮转 → 释放锁
+ *               3. Wait 返回 CLOSE_EMPTY（关闭且缓冲空）→ 退出
+ *               4. shutting_down 且 used==0 时兜底退出（防 CLOSE_EMPTY 被吞的情况）
+ *
+ *               退出后再执行一次锁内兜底排空 + fclose，保证优雅关闭数据完整。
+ *
+ *               类型转换说明：
+ *               - StreamBufferAPI_GetData 返回 int（>=0 且 <=max），转 size_t 传 fwrite 安全；
+ *               - fwrite 返回 size_t，本函数用 (int)w 与 n 比较：因 n<=sizeof(buf)=2KB
+ *                 远小于 INT_MAX，(int)w 转换无溢出风险。
  */
 static void *fw_consumer_thread(void *arg)
 {
@@ -907,9 +915,12 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
 
 int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
 {
+    /* 栈 buffer：单条日志上限 FW_FORMAT_BUF_SIZE(1KB)。
+     * 由于 StreamBuffer.PutData 内部立即 memcpy，返回后 buf 可复用，
+     * 不需要 MemoryPool 之类跨线程持有 buffer 的机制。 */
     char buf[FW_FORMAT_BUF_SIZE];
-    int offset = 0;
-    int n;
+    int offset = 0;    /* 时间戳前缀长度（若开启） */
+    int n;             /* vsnprintf 返回值 */
     int fmt_len;
     va_list ap;
 
@@ -918,29 +929,32 @@ int FileWriterAPI_Write(T_FileWriter *fw, const char *fmt, ...)
         return -1;
     }
 
-    /* 时间戳前缀 */
+    /* 时间戳前缀 [HH:MM:SS.mmmmmm] （config.timestamp==1 时开启） */
     if(fw->config.timestamp)
     {
         fw_get_timestamp_str(buf, FW_TIMESTAMP_STR_LEN);
         offset = (int)strlen(buf);
     }
 
-    /* 格式化（用 vsnprintf 返回值算总长，省一次 strlen） */
+    /* 格式化：vsnprintf 返回"若空间够会写入的字节数"（不含 '\0'），
+     * 直接用它算 fmt_len，省一次 strlen。 */
     va_start(ap, fmt);
     n = vsnprintf(buf + offset, sizeof(buf) - offset, fmt, ap);
     va_end(ap);
     if(n < 0)
     {
+        /* vsnprintf 遇编码错误极少发生；出现即视为参数无效 */
         return -1;
     }
-    /* n 是"若空间够会写入的字节数"；超长时截断到 buffer 末尾 */
+    /* 超长时截断到 buffer 末尾（不含末尾 '\0'），仅丢内容不越界 */
     if(n > (int)sizeof(buf) - offset - 1)
     {
         n = (int)sizeof(buf) - offset - 1;
     }
     fmt_len = offset + n;
 
-    /* 入队（StreamBuffer 内部 memcpy，返回后 buf 可复用/释放） */
+    /* 入队（StreamBuffer 内部 memcpy，返回后 buf 可复用/释放）。
+     * PutData 返回值：>=0 入队字节数；-1 参数无效；-2 已关闭；-3 缓冲满丢弃。 */
     return StreamBufferAPI_PutData(fw->sb, buf, fmt_len);
 }
 
@@ -1119,13 +1133,15 @@ int FileWriterAPI_StatsGet(T_FileWriter *fw, T_FileWriterStats *out)
         return -1;
     }
 
-    /* SB used 和 file_count 不持 file_lock 也能拿：
-     * - SB 内部自持锁；
-     * - GetFileCount 会自行处理并发（自己也拿 file_lock 快照目录路径）。
-     * 先取这两个避免锁嵌套。 */
+    /* SB used 和 file_count 不持 file_lock 也能拿；且必须在拿 file_lock 前取，
+     * 避免锁嵌套：
+     * - StreamBufferAPI_GetLength 内部持 SB 自己的锁；
+     * - FileWriterAPI_GetFileCount 内部会拿 file_lock 快照目录路径。
+     * 若这里已持 file_lock 再调 GetFileCount，会自锁死锁。 */
     sb_used    = StreamBufferAPI_GetLength(fw->sb);
     file_count = FileWriterAPI_GetFileCount(fw);
 
+    /* 累计计数器由 file_lock 保护 */
     pthread_mutex_lock(&fw->file_lock);
     out->bytes_written = fw->stat_bytes_written;
     out->bytes_lost    = fw->stat_bytes_lost;
@@ -1133,6 +1149,7 @@ int FileWriterAPI_StatsGet(T_FileWriter *fw, T_FileWriterStats *out)
     out->rotate_fail   = fw->stat_rotate_fail;
     pthread_mutex_unlock(&fw->file_lock);
 
+    /* 负值兜底：SB/文件系统 API 返回 -1 表示查询失败，对用户呈 0 更合理 */
     out->sb_used    = (sb_used    >= 0) ? sb_used    : 0;
     out->file_count = (file_count >= 0) ? file_count : 0;
     return 0;

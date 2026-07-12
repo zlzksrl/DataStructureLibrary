@@ -14,7 +14,7 @@
  *              - 时间戳前缀:        可选 [HH:MM:SS.mmmmmm] 前缀
  *              - 文件轮转:          按大小(max_file_size) / 跨日(auto_rotate_daily) / 手动(Rotate)
  *              - 日期子目录:        可配 date_subdir_prefix，如 X → /log/X2026_07_11/
- *              - 文件命名:          {prefix}{序号3位}_{YYYY-MM-DD-HH-MM-SS}.{ext}
+ *              - 文件命名:          {prefix}_{序号3位}_{YYYY-MM-DD-HH-MM-SS}.{ext}
  *              - 多实例可重入:      一个进程 Init 多个 FileWriter（各自独立线程+文件）
  *              - SCHED_RR 线程:     消费线程用 ThreadManage 创建，SCHED_RR 策略，可配优先级
  *              - 优雅关闭:          Close→排空缓冲→fflush+fclose→线程退出
@@ -41,7 +41,6 @@
  *              // 业务线程：printf 式写入
  *              FileWriterAPI_Write(fw, "[%s] ret=%d\n", "moduleA", ret);
  *
- *              // 优雅关闭
  *              // 优雅关闭（一步到位：排空+落盘+释放）
  *              FileWriterAPI_Destroy(&fw);
  *              @endcode
