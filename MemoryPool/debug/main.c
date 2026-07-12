@@ -494,14 +494,20 @@ static void test_stolen_wakeup(void)
     MemPoolAPI_StatsGet(g_stl_pool, &st);
     Debug_printx("stolen_wakeup: success=%d fail=%d (alloc=%"PRIu64" drop=%"PRIu64")",
                  total_success, total_fail, st.ulTotalAlloc, st.ulTotalDrop);
-    TEST_ASSERT(total_success + total_fail == STL_ROUNDS * STL_WAITERS,
-                "stolen: total waiters=%d", STL_ROUNDS * STL_WAITERS);
-    TEST_ASSERT((int)st.ulTotalAlloc == total_success,
-                "stolen: total_alloc=%"PRIu64" match success=%d", st.ulTotalAlloc, total_success);
-    TEST_ASSERT((int)st.ulTotalDrop  == total_fail,
-                "stolen: total_drop=%"PRIu64" match fail=%d", st.ulTotalDrop, total_fail);
-    TEST_ASSERT(total_success >= STL_ROUNDS * STL_WAITERS / 2,
-                "stolen: success rate >=50%% (Free 全部到位)");
+    /* 每轮先 Alloc 抽干池(STL_WAITERS 次)再起等待者(STL_WAITERS 次)：
+       total_alloc = drain(ROUNDS*WAITERS) + 等待者成功数(total_success) */
+    {
+        int drain = STL_ROUNDS * STL_WAITERS;
+        TEST_ASSERT(total_success + total_fail == drain,
+                    "stolen: total waiters=%d", drain);
+        TEST_ASSERT((int)st.ulTotalAlloc == total_success + drain,
+                    "stolen: total_alloc(%"PRIu64") == success(%d) + drain(%d)",
+                    st.ulTotalAlloc, total_success, drain);
+        TEST_ASSERT((int)st.ulTotalDrop  == total_fail,
+                    "stolen: total_drop=%"PRIu64" match fail=%d", st.ulTotalDrop, total_fail);
+        TEST_ASSERT(total_success >= drain / 2,
+                    "stolen: success rate >=50%% (Free 全部到位)");
+    }
     MemPoolAPI_Destroy(&g_stl_pool);
 }
 

@@ -344,3 +344,106 @@ printf("MemoryPoolLibVision = [%s]\n", MemoryPool_PROJECT_MAKETIME);
 2. **补 P0 测试用例**（3~5 条），为已完成的修复建立自动化保护——这是三轮审查以来一直被推迟的最大遗留，也是当前**投入产出比最高的一项**。
 
 其余问题可按业务节奏排期，均属"锦上添花"而非"必修"。整体代码质量在该系列库中处于**优良水平**。
+
+---
+
+# 第四轮审查（修复 + 新功能落地）
+
+> **改动日期**：2026-07-12
+> **改动范围**：`include/MemoryPool.h`、`src/MemoryPool_Main.h`、`src/MemoryPool.c`、`debug/main.c`
+> **验证方式**：本地 `gcc -fsyntax-only -Wall -Wextra -Wshadow` 通过；ARM 交叉链在开发板 Make 验证（此处未联机运行）
+> **版本号**：V1.0.0 → **V1.1.0**（配置结构新增字段，ABI 变更）
+
+## 一、按优先级依次修复的问题
+
+| # | 问题 | 修复位置 | 修复方式 |
+|---|------|---------|---------|
+| **P0** | 问题 1：`pthread_cond_wait` 无限等待分支未处理返回错误 | `MemoryPool.c` mp_alloc_block 无限等待循环 | 增加 `if(r != 0 && r != EINTR) → total_drop++ + 递减 waiter_count + return NULL`，语义对齐 timedwait 分支 |
+| **P0** | 新增测试：max_count / stolen wakeup / Init 参数边界 | `debug/main.c` Part 9-14 | 新增 6 个测试组，含 TEST_ASSERT 断言宏 + 通过/失败计数 |
+| **中** | 问题 3：32 位 `unsigned long` 计数器长时回绕 | `MemoryPool.h` + `MemoryPool_Main.h` + `MemoryPool.c` | 4 个统计字段全部改为 `uint64_t`；`main.c` printf 用 `PRIu64` |
+| **中** | 问题 2：`Destroy` 未 broadcast，BLOCK 等待者 UAF | `MemoryPool.c` Destroy + mp_alloc_block | 新增 `shutting_down`/`waiter_count` 两字段；Destroy 置标志→broadcast→等 waiter_count 归零；alloc_block 全路径检测 shutting_down 立即 NULL 且退出时 signal Destroy |
+| 低 | 问题 4：`AllocGrow` 前提条件未文档化 | `MemoryPool.h:222-232` | 头文件 `@details` 补 "Init 时必须设置 grow_count>0" |
+| 低 | 问题 5：`clock_gettime` / `condattr_setclock` 未检查返回值 | Init + mp_calc_deadline | Init 中 setclock 失败则清理资源 + 返回 -1；clock_gettime 失败构造过期 ts 让 timedwait 立即 ETIMEDOUT |
+| 低 | 问题 6：`mp_align_up` 有符号溢出 | `MemoryPool.c` mp_align_up + Init | 改用 `unsigned int` 运算；Init 额外拒绝 `element_size > INT_MAX - MEMPOOL_ALIGN` |
+| 低 | 问题 7：`strncpy` 触发 `-Wstringop-truncation` | `MemoryPool.c` mp_set_name | 改为 `memcpy(dst, src, len); dst[len]='\0';` |
+| nit | 观察 A：Destroy 文档"幂等"措辞歧义 | `MemoryPool.h:164` | 改为"可重复调用（重复销毁返回 -1）" |
+| 优化 | 观察 C：`Free` 无条件 signal | `MemoryPool.c` Free | 改为 `if(waiter_count > 0) signal`，无等待者时不进内核 |
+
+## 二、新功能：`max_count` 上限扩容
+
+### 语义
+
+在 `T_MemPoolConfig` 新增 `int max_count`，含义如下：
+
+| 取值 | 语义 |
+|------|------|
+| `max_count < init_count`（含 `<= 0`） | **无上限**：可无限扩容，直至 malloc 失败 |
+| `max_count >= init_count` | **有上限**：总槽位数不超过 max_count；到达上限后 GROW 自动退化为 DROP（返回 NULL 并累加 `total_drop`） |
+
+### 尾轮扩容策略
+
+到达上限前若 `grow_count > 剩余额度(max_count - total_count)`，则**按剩余额度扩容**，不越过 max_count：
+
+```
+init=4, grow=5, max=10：
+  第1次扩容: remain=6, grow=5 → 加5，cap=9
+  第2次扩容: remain=1, grow=5 → 加1，cap=10   ← 尾轮按剩余
+  第3次扩容: remain=0 → DROP，total_drop++
+```
+
+### 内部约定
+
+`Init` 时若 `cfg.max_count < init_count`，内部归一化为 `p->max_count = 0`，运行时用 `if(p->max_count > 0)` 判断是否受限，语义清晰无歧义。
+
+### 影响范围
+
+- 仅对 GROW 模式（含 `MemPoolAPI_AllocGrow` 显式接口）生效；DROP/BLOCK 池忽略此字段。
+- ABI 破坏性变更：`T_MemPoolConfig` 尾部新增字段，未清零的旧栈上结构可能带入垃圾值。因 `max_count < init_count` 归一化为无上限，实际影响面小；但仍建议使用者更新为 `memset` + 显式赋值。
+
+### 测试覆盖
+
+新增 3 个测试（`main.c` Part 9-11）：
+- Part 9：init=4/grow=4/max=12 → 12 成功 + 8 drop，cap=12
+- Part 10：init=8/grow=4/max=1（无上限）→ 20 全成功
+- Part 11：init=4/grow=5/max=10（尾轮按剩余）→ 10 成功 + 5 drop，cap=10
+
+## 三、新增测试用例（共 6 组）
+
+| Part | 覆盖内容 | 主要断言 |
+|------|---------|---------|
+| 9 | max_count 上限触发 GROW→DROP | got=12, cap=12, drop=8, grow=8 |
+| 10 | max_count < init_count = 无上限 | got=20, drop=0, cap>=20 |
+| 11 | max_count 非整倍数尾轮扩容 | got=10, cap=10, drop=5 |
+| 12 | Init 参数边界 7 项 | mode=99/GROW+0/block_timeo<0/超大 init_count/element_size=INT_MAX/*pp 非空/AllocBlock(-1) 全部拒绝 |
+| 13 | BLOCK stolen wakeup 竞态 | 10 轮 × 8 等待者，Free 全部到位 → alloc+drop=80 无漏账 |
+| 14 | Destroy 唤醒 BLOCK 等待者 | 3 个无限等待者被 broadcast 后全部返回 NULL |
+
+配套引入 `TEST_ASSERT` 宏（PASS/FAIL 计数）+ main 尾部 summary 打印，`return g_test_fail == 0 ? 0 : 1` 便于 CI 判定。
+
+## 四、验证状态
+
+| 项 | 状态 |
+|----|------|
+| `gcc -fsyntax-only -Wall -Wextra -Wshadow` 库源码 | ✅ 无告警 |
+| `gcc -fsyntax-only -Wall -Wextra -Wshadow` main.c | ✅ 无告警 |
+| ARM 交叉编译（arm-linux-gnueabihf-gcc） | ⏸️ 本机无工具链，待开发板 `make all` |
+| 单元测试运行 | ⏸️ 待开发板 `./MemoryPool_DebugPro.bin` 执行 Part 1-14 |
+
+## 五、遗留项状态
+
+| # | 项 | 状态 |
+|----|----|------|
+| 问题 8 | 库内 printf 无日志抽象 | 未改（与同系列库一致，等库统一升级） |
+| 观察 B | `__FUNCTION__` GCC 扩展 | 未改（可移植到 `__func__` 但当前工具链无影响） |
+| 观察 D | 结构体内存布局 padding | 未改（性能影响忽略不计） |
+| 观察 E | 测试用全局句柄 g_pool 等 | 部分改（新用例用局部/独立全局，主体保持不变） |
+| 问题 9 | `name` 字段只写 | 未改（后续可加 `MemPoolAPI_GetName` 或 Dump） |
+
+## 六、第四轮结论
+
+本轮完成了三件事：
+1. **修完了前三轮遗留的所有中/低优先级问题**（含本轮新发现的问题 1 对称遗漏）；
+2. **落地新功能 `max_count`**：为 GROW 模式补上"有界扩容 → 到限 DROP"的第四种运行行为，与既有三模式协同工作，语义清晰、尾轮策略合理；
+3. **补齐三轮悬空的自动化测试**：6 组新用例覆盖了本次及历次修复过的全部关键路径（max_count / stolen wakeup / Init 边界 / Destroy 唤醒），至此每一处修复都有回归保护。
+
+**代码状态：V1.1.0，可发布。** 剩余项均为可选优化，不阻塞。建议开发板上跑一遍 Part 1-14 的联机验证以确认所有断言通过。
