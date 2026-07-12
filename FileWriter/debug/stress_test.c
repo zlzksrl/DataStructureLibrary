@@ -32,7 +32,6 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
-#include <errno.h>
 #include <stdint.h>
 #include <inttypes.h>
 

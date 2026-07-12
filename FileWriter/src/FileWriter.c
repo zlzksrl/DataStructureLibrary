@@ -16,16 +16,29 @@
  *              - thread_running / shutting_down 为 volatile int（跨线程标志位）
  *              - StreamBuffer 内部线程安全
  *
+ *              抗并发销毁 (V1.1)：
+ *              - 四个 atomic 字段协作实现"业务线程持有句柄期间可安全并发 Destroy"：
+ *                  ref_count       — 保护区引用计数（Write/Rotate/查询等入/出保护区时 +1/-1）
+ *                  destroying      — Destroy 已开始的标志（阻止新的保护区进入）
+ *                  destroy_pending — Phase B 触发标志（Destroy 已放弃 spin-wait）
+ *                  finalize_taken  — 释放权 CAS(0→1) 独占锁，保证 fw_final_free 只调一次
+ *              - 保护区宏 FW_ENTER_GUARD / FW_LEAVE_GUARD 定义于本文件顶部。
+ *              - Destroy 分两阶段（详见 FileWriterAPI_Destroy 内 Phase A/B 注释）：
+ *                  Phase A：置 destroying → Close SB → join 消费线程 → 数据落盘 → spin-wait
+ *                          ref_count 归零（超时 destroy_wait_ms，默认 500ms）→ CAS 抢释放权
+ *                  Phase B：超时后置 destroy_pending → 最后一个 LEAVE 的 Writer 抢 CAS 兜底释放
+ *              - 极端情况下（Writer 永挂）实例内存延迟释放，但保证不 UAF、不 double-free。
+ *
  * @author      zlzksrl
- * @Version     V1.0.0
- * @date        2026-07-11
+ * @Version     V1.1.0
+ * @date        2026-07-12
  * @copyright   copyright (C) 2026
  */
 
 /**
- * @date        2026-07-11
- * @Version     V1.0.0
- * @brief       创建文件，实现异步文件写入全套API
+ * @date        2026-07-12
+ * @Version     V1.1.0
+ * @brief       创建文件，实现异步文件写入全套API（含抗并发销毁）
  * @author      zlzksrl
  */
 #include "FileWriter_Main.h"
@@ -1041,8 +1054,10 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
         }
     }
 
-    /* A7. 归零：干净路径。仍然要用 CAS 抢释放权——理论上 destroy_pending 尚未置位，
-     *     没有 Writer 会去调 fw_final_free，但为一致性和防御性，这里也用 CAS。 */
+    /* A7. 归零：干净路径。CAS(finalize_taken, 0→1) 独占抢释放权。
+     *     此路径下 destroy_pending 未置位，LEAVE 侧的 CAS 分支进不去、
+     *     finalize_taken 必然保持 0，本 CAS 一定成功。使用 CAS 而非直接置位，
+     *     是为了与 Phase B 路径保持"独占抢锁"的一致语义。 */
     ref_left = atomic_load_explicit(&pt->ref_count, memory_order_acquire);
     if(0 == ref_left)
     {
@@ -1055,8 +1070,8 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
             fw_final_free(pt);
             return 0;
         }
-        /* 走到这里说明有 Writer 抢先 CAS 成功——但这几乎不可能：
-         * destroy_pending 未置位，LEAVE 侧的 CAS 分支进不去。留作防御。 */
+        /* 不可达：如上所述，此路径下 CAS 必成功。
+         * 若真被触发说明有严重的时序推理错误，保留该分支防御性返回不释放。 */
         *pp = NULL;
         return 0;
     }

@@ -1,6 +1,6 @@
 /**
  * @file        main.c
- * @brief       FileWriter 异步文件写入 - 测试/演示程序
+ * @brief       FileWriter 异步文件写入 - 功能演示程序
  * @details     覆盖需求文档"典型应用"及 API 全表面，分 7 段用例：
  *
  *              Part 1: 异步日志 (LOG)  —— printf 式格式化 + 时间戳前缀
@@ -13,9 +13,11 @@
  *
  *              所有输出集中在 ./fw_test/ 下（见 TEST_ROOT 目录树注释）。
  *
+ *              抗并发销毁高压测试见同目录 stress_test.c（`make stress`）。
+ *
  * @author      zlzksrl
- * @Version     V1.0.0
- * @date        2026-07-11
+ * @Version     V1.1.0
+ * @date        2026-07-12
  * @copyright   copyright (C) 2026
  */
 #include <stdlib.h>

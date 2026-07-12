@@ -9,7 +9,7 @@ AR = arm-linux-gnueabihf-ar
 # 项目配置
 # ==============================================================================
 TARGET_Name        = FileWriter
-ProgramVER         = 1.0.0
+ProgramVER         = 1.1.0
 USERNAME           = zlzksrl
 # 用 ?= 使 CI/环境变量可 override：make LIBFILE_PATH=/opt/lib
 LIBFILE_PATH      ?= ~/zlzksrl/LinuxARM/Program/DataStructureLibrary/Library
@@ -38,10 +38,13 @@ ThreadManage_LIBINCPATH		= -I $(LIBFILE_PATH)/ThreadManage/include
 # ==============================================================================
 # 编译选项
 # ==============================================================================
-# -g:      生成调试信息（GDB 调试用）
-# -Wall:   开启常见警告
-# -Wextra: 开启额外警告
-CFLAGS  = -g -Wall -Wextra 
+# -g:          生成调试信息（GDB 调试用）
+# -Wall:       开启常见警告
+# -Wextra:     开启额外警告
+# -std=gnu11:  显式指定 C11 + GNU 扩展。V1.1 抗并发销毁依赖 <stdatomic.h>（C11），
+#              gnu11 同时打开 _GNU_SOURCE 保证 pthread/clock_gettime 等 POSIX 扩展可见。
+#              GCC 4.9+ 支持；用老工具链需自行调整。
+CFLAGS  = -g -Wall -Wextra -std=gnu11
 CFLAGS  := $(CFLAGS) -pthread
 CFLAGS  := $(CFLAGS) $(ThreadQueue_LIBINCPATH)
 CFLAGS  := $(CFLAGS) $(StreamBuffer_LIBINCPATH)

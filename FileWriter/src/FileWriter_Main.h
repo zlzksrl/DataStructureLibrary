@@ -6,14 +6,14 @@
  *              外部用户通过 include/FileWriter.h 访问公共API。
  *
  * @author      zlzksrl
- * @Version     V1.0.0
- * @date        2026-07-11
+ * @Version     V1.1.0
+ * @date        2026-07-12
  * @copyright   copyright (C) 2026
  */
 
 /**
- * @date        2026-07-11
- * @Version     V1.0.0
+ * @date        2026-07-12
+ * @Version     V1.1.0
  * @brief       创建文件
  * @author      zlzksrl
  */
@@ -73,8 +73,14 @@
 /*  并发访问约定:                                                     */
 /*    - "受 file_lock 保护"字段：读或写前必须持 file_lock；           */
 /*      任何以 _locked 结尾的内部函数都假定调用者已持锁。             */
-/*    - volatile 字段：跨线程读写，靠 volatile 保证可见性 + 消费线程  */
-/*      每轮都会经过 mutex（间接建立内存屏障）。                       */
+/*    - volatile 字段（thread_running/shutting_down）：跨线程读写，   */
+/*      靠 volatile 保证可见性 + 消费线程每轮都会经过 mutex（间接建立  */
+/*      内存屏障）。                                                  */
+/*    - atomic_int 字段（ref_count/destroying/destroy_pending/       */
+/*      finalize_taken）：抗并发销毁的核心，无锁访问，用             */
+/*      memory_order_acquire/release/acq_rel 显式指定顺序。          */
+/*      详见 FileWriter.c 顶部 FW_ENTER_GUARD/FW_LEAVE_GUARD 宏      */
+/*      和 FileWriterAPI_Destroy 的 Phase A/B 注释。                 */
 /*    - StreamBuffer 内部自持锁，可在任意时刻并发调用。                */
 /*    - fp/current_* 与 fwrite/查询接口共享 file_lock，因此 IO 抖动    */
 /*      期间查询接口会被阻塞——这是明确的设计权衡（简单 > 无锁读）。   */

@@ -18,6 +18,9 @@
  *              - 多实例可重入:      一个进程 Init 多个 FileWriter（各自独立线程+文件）
  *              - SCHED_RR 线程:     消费线程用 ThreadManage 创建，SCHED_RR 策略，可配优先级
  *              - 优雅关闭:          Close→排空缓冲→fflush+fclose→线程退出
+ *              - 抗并发销毁 (V1.1): 业务线程持有句柄期间可安全并发调 Destroy，
+ *                                   最坏 Write 返回 -2，不 UAF、不 double-free
+ *              - 运行统计:          StatsGet 查累计写盘/丢失字节数、轮转成功/失败、缓冲积压
  *
  *              典型应用: 异步日志、CSV 记录、二进制 bin 文件
  *              @code
@@ -46,15 +49,15 @@
  *              @endcode
  *
  * @author      zlzksrl
- * @Version     V1.0.0
- * @date        2026-07-11
+ * @Version     V1.1.0
+ * @date        2026-07-12
  * @copyright   copyright (C) 2026
  */
 
 /**
- * @date        2026-07-11
- * @Version     V1.0.0
- * @brief       创建文件，提供异步文件写入全套API
+ * @date        2026-07-12
+ * @Version     V1.1.0
+ * @brief       创建文件，提供异步文件写入全套API（含抗并发销毁）
  * @author      zlzksrl
  */
 #ifndef __FileWriter_H__
