@@ -6,15 +6,21 @@
  *              1. 不崩溃（无 UAF、无 double-free、无锁悬空）
  *              2. Destroy 有界返回（不超过 destroy_wait_ms 的显著时间）
  *              3. 数据完整性：Destroy 返回后已入队的数据都落盘
- *              4. Phase B 触发时能被计数（观察是否稳定进入延迟释放路径）
+ *              4. Phase B 兜底释放路径覆盖到（destroy_pending + finalize_taken CAS）
  *
- *              测试矩阵：
- *              - Round 1-20: 每轮 4 个 Writer 线程 + 1 个 Rotate 线程 + 1 个 Query 线程；
- *                            主线程 10-500ms 后调 Destroy；重复 20 轮。
- *              - Round 21-30: 极端场景（Destroy 立即触发，不给 Writer 起跑时间）
+ *              三段测试矩阵（默认 50 + 30 + 30 = 110 轮）：
  *
- *              编译：make stress_test（见 Makefile）
- *              运行：./stress_test.bin
+ *              Stage 1  NORMAL     — 每轮 6 个 Writer 疯狂写 2-5s，
+ *                                    然后主线程 Destroy（wait 200-1000ms）。
+ *                                    单轮估算 100 万+ 次 Write，总量千万级。
+ *              Stage 2  IMMEDIATE  — Writer 0-20ms 就 Destroy，
+ *                                    测启动窗口的 race。
+ *              Stage 3  PHASE_B    — Writer 跑 1-3s + 极小 destroy_wait_ms（1-5ms），
+ *                                    几乎必进 Phase B 兜底释放路径，
+ *                                    验证 finalize_taken CAS 独占抢释放权正确。
+ *
+ *              编译：make stress（见 Makefile）
+ *              运行：./FileWriter_Stress.bin
  *
  * @author      zlzksrl
  * @Version     V1.1.0
@@ -27,6 +33,8 @@
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "../include/FileWriter.h"
 
@@ -64,17 +72,14 @@ static T_WorkerStats g_stats[WRITER_THREADS];
 /* 全局累计统计（所有轮次汇总） */
 typedef struct
 {
-    unsigned long long total_calls;
-    unsigned long long total_ok;
-    unsigned long long total_rejected_uninit;
-    unsigned long long total_rejected_closed;
-    unsigned long long total_rejected_full;
-    unsigned long long total_bytes_ok;         /* 估算：ok 次数 * 平均字节 */
-    unsigned long long total_rotate_calls;
-    unsigned long long total_query_calls;
+    uint64_t           total_calls;
+    uint64_t           total_ok;
+    uint64_t           total_rejected_uninit;
+    uint64_t           total_rejected_closed;
+    uint64_t           total_rejected_full;
     long               max_destroy_latency_us;
     long               sum_destroy_latency_us;
-    int                phase_b_deferred_count; /* Phase B 触发次数（依赖日志难以直接感知，这里用启发式：Destroy 耗时接近 wait_ms 才计入） */
+    int                phase_b_deferred_count; /* 启发式：Destroy 耗时接近 wait_ms 才计入 */
     int                rounds_done;
 } T_GlobalStats;
 
@@ -154,6 +159,7 @@ static void *rotate_thread(void *arg)
     while(!g_round_stop)
     {
         FileWriterAPI_Rotate(local_fw);
+        g_rotate_call_count++;
         /* 隔 30-80ms 一次 */
         usleep(30 * 1000 + (rand() % (50 * 1000)));
     }
@@ -178,14 +184,19 @@ static void *query_thread(void *arg)
         FileWriterAPI_GetTotalFileCount(local_fw);
         FileWriterAPI_StatsGet(local_fw, &st);
         FileWriterAPI_Flush(local_fw);
+        g_query_call_count += 7;
         usleep(1000);   /* 1ms 一轮 */
     }
     return NULL;
 }
 
-/* ========================== 单轮测试 ========================== */
-
-static int run_one_round(int round_idx, int destroy_delay_ms, int destroy_wait_ms)
+/* ========================== 单轮测试 ==========================
+ *
+ * @param round_idx          轮次编号
+ * @param write_duration_ms  Writer 线程正常压测时长（先跑够这个时间再 Destroy）
+ * @param destroy_wait_ms    Destroy 内部等 in-flight Writer 的超时
+ */
+static int run_one_round(int round_idx, int write_duration_ms, int destroy_wait_ms)
 {
     T_FileWriterConfig cfg;
     pthread_t tids[WRITER_THREADS];
@@ -193,10 +204,12 @@ static int run_one_round(int round_idx, int destroy_delay_ms, int destroy_wait_m
     int worker_ids[WRITER_THREADS];
     int i;
     long t_start_us, t_destroy_us, t_destroyed_us;
+    long destroy_latency_us;
     int rc;
 
     printf("\n==================== Round %d ====================\n", round_idx);
-    printf("delay=%dms, destroy_wait=%dms\n", destroy_delay_ms, destroy_wait_ms);
+    printf("write_duration=%dms, destroy_wait=%dms, writers=%d\n",
+           write_duration_ms, destroy_wait_ms, WRITER_THREADS);
 
     memset(g_stats, 0, sizeof(g_stats));
     g_round_stop = 0;
@@ -239,10 +252,11 @@ static int run_one_round(int round_idx, int destroy_delay_ms, int destroy_wait_m
     pthread_create(&tid_rotate, NULL, rotate_thread, NULL);
     pthread_create(&tid_query,  NULL, query_thread,  NULL);
 
-    /* 主线程随机等一段时间后调 Destroy（模拟"信号来了"） */
-    if(destroy_delay_ms > 0)
+    /* 让 Writer 充分跑一段时间——这是真正的"高压期"。
+     * write_duration_ms=0 时相当于立即销毁的极端场景。 */
+    if(write_duration_ms > 0)
     {
-        usleep(destroy_delay_ms * 1000);
+        usleep(write_duration_ms * 1000);
     }
 
     t_destroy_us = now_us();
@@ -250,6 +264,7 @@ static int run_one_round(int round_idx, int destroy_delay_ms, int destroy_wait_m
     /* 关键操作：在业务线程疯狂写的时候调 Destroy——这是本测试的核心 */
     rc = FileWriterAPI_Destroy(&g_fw);
     t_destroyed_us = now_us();
+    destroy_latency_us = t_destroyed_us - t_destroy_us;
 
     if(rc != 0)
     {
@@ -267,10 +282,10 @@ static int run_one_round(int round_idx, int destroy_delay_ms, int destroy_wait_m
     pthread_join(tid_rotate, NULL);
     pthread_join(tid_query,  NULL);
 
-    /* 打印结果 */
-    printf("Destroy latency: %ld us (%.1f ms), from-start=%ld ms\n",
-           t_destroyed_us - t_destroy_us,
-           (t_destroyed_us - t_destroy_us) / 1000.0,
+    /* 打印本轮结果 */
+    printf("Destroy latency: %ld us (%.1f ms), write phase=%ld ms\n",
+           destroy_latency_us,
+           destroy_latency_us / 1000.0,
            (t_destroy_us - t_start_us) / 1000);
 
     unsigned long total_calls = 0, total_ok = 0, total_uninit = 0;
@@ -285,6 +300,24 @@ static int run_one_round(int round_idx, int destroy_delay_ms, int destroy_wait_m
     }
     printf("Writes: calls=%lu ok=%lu (-1)=%lu (-2)=%lu (-3)=%lu\n",
            total_calls, total_ok, total_uninit, total_closed, total_full);
+
+    /* 累计到全局统计 */
+    g_global.total_calls           += total_calls;
+    g_global.total_ok              += total_ok;
+    g_global.total_rejected_uninit += total_uninit;
+    g_global.total_rejected_closed += total_closed;
+    g_global.total_rejected_full   += total_full;
+    g_global.sum_destroy_latency_us += destroy_latency_us;
+    if(destroy_latency_us > g_global.max_destroy_latency_us)
+    {
+        g_global.max_destroy_latency_us = destroy_latency_us;
+    }
+    /* 启发式：Destroy 耗时 >= wait_ms 的 80% 视为触发了 Phase B（用于观察，非精确） */
+    if(destroy_latency_us >= (long)destroy_wait_ms * 800)
+    {
+        g_global.phase_b_deferred_count++;
+    }
+    g_global.rounds_done++;
 
     /* 关键断言：如果程序跑到这里没崩，就通过了 */
     printf("Round %d: PASS (no crash)\n", round_idx);
@@ -310,50 +343,90 @@ int main(int argc, char *argv[])
     srand(seed);
     printf("seed = %d\n", seed);
 
-    /* 常规轮次：给业务线程 10-500ms 起跑时间后 Destroy */
+    /* ==============================================================
+     * 常规轮次：Writer 充分跑 2-5s 再销毁。
+     * 单轮预期数据量：6 线程 * ~2-5s * ~100k calls/s ≈ 1M~3M 次 Write
+     * ============================================================== */
+    printf("\n\n=========================================\n");
+    printf("Stage 1: NORMAL — 50 rounds, 2-5s writes\n");
+    printf("=========================================\n");
     for(round = 1; round <= ROUNDS_NORMAL; round++)
     {
-        int delay_ms = 10 + rand() % 490;
-        int wait_ms  = 100 + rand() % 900;   /* destroy_wait_ms: 100-1000ms */
-        if(run_one_round(round, delay_ms, wait_ms) != 0)
+        int write_ms = 2000 + rand() % 3000;   /* 2-5 秒 */
+        int wait_ms  = 200 + rand() % 800;     /* 200-1000ms */
+        if(run_one_round(round, write_ms, wait_ms) != 0)
         {
             printf("Round %d FAILED, abort\n", round);
             return 1;
         }
     }
 
-    /* 极端轮次：Destroy 几乎立即到来，业务线程可能还没起来 */
+    /* ==============================================================
+     * 极端轮次：Writer 刚起来（0-20ms）就销毁——测启动窗口的 race
+     * ============================================================== */
+    printf("\n\n=========================================\n");
+    printf("Stage 2: IMMEDIATE — 30 rounds, 0-20ms writes\n");
+    printf("=========================================\n");
     for(round = 1; round <= ROUNDS_IMMEDIATE; round++)
     {
-        int delay_ms = rand() % 5;          /* 0-4ms */
-        int wait_ms  = 50 + rand() % 200;   /* 50-250ms */
-        if(run_one_round(ROUNDS_NORMAL + round, delay_ms, wait_ms) != 0)
+        int write_ms = rand() % 20;             /* 0-19ms，几乎没起跑就销毁 */
+        int wait_ms  = 50 + rand() % 200;
+        if(run_one_round(ROUNDS_NORMAL + round, write_ms, wait_ms) != 0)
         {
             printf("Immediate round %d FAILED, abort\n", round);
             return 1;
         }
     }
 
-    /* Phase B 专项：极小 destroy_wait_ms + Rotate 密集触发，
-     * 让 spin-wait 更容易超时，从而走 Phase B 兜底释放路径。
-     * 观察日志里应该出现 "destroy deferred" 才算测到位。 */
-    printf("\n\n----- Phase B trigger rounds -----\n");
-    for(round = 1; round <= 10; round++)
+    /* ==============================================================
+     * Phase B 专项：Writer 跑一会 + 极小 destroy_wait_ms
+     * 让 spin-wait 极易超时，走 Phase B 兜底释放路径。
+     * 观察日志应出现 "destroy deferred"。
+     * ============================================================== */
+    printf("\n\n=========================================\n");
+    printf("Stage 3: PHASE_B — %d rounds, 1-3s writes + 1-5ms wait\n",
+           ROUNDS_PHASE_B);
+    printf("=========================================\n");
+    for(round = 1; round <= ROUNDS_PHASE_B; round++)
     {
-        int delay_ms = 50 + rand() % 150;
-        int wait_ms  = 1 + rand() % 5;      /* 1-5ms，极短，几乎注定 Phase B */
+        int write_ms = 1000 + rand() % 2000;   /* 1-3 秒 */
+        int wait_ms  = 1 + rand() % 5;         /* 1-5ms，几乎必进 Phase B */
         if(run_one_round(ROUNDS_NORMAL + ROUNDS_IMMEDIATE + round,
-                         delay_ms, wait_ms) != 0)
+                         write_ms, wait_ms) != 0)
         {
             printf("Phase B round %d FAILED, abort\n", round);
             return 1;
         }
     }
 
-    printf("\n\n==================== ALL PASSED ====================\n");
-    printf("Total rounds: %d\n", ROUNDS_NORMAL + ROUNDS_IMMEDIATE + 10);
-    printf("No crash observed.\n");
-    printf("Check ./stress_test/RYYYY_MM_DD/roundNNN/w_*.log for data integrity.\n");
-    printf("Look for 'destroy deferred' in the log above to confirm Phase B was exercised.\n");
+    /* ==============================================================
+     * 总结报告
+     * ============================================================== */
+    printf("\n\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║                    ALL PASSED — SUMMARY                      ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    printf("seed                       = %d\n", seed);
+    printf("Total rounds               = %d (normal:%d + immediate:%d + phase_b:%d)\n",
+           g_global.rounds_done, ROUNDS_NORMAL, ROUNDS_IMMEDIATE, ROUNDS_PHASE_B);
+    printf("Total Write/WriteBin calls = %" PRIu64 "\n", g_global.total_calls);
+    printf("  ok  (>=0)                = %" PRIu64 " (%.1f%%)\n",
+           g_global.total_ok,
+           g_global.total_calls ? 100.0 * (double)g_global.total_ok / (double)g_global.total_calls : 0.0);
+    printf("  -1  (uninit/err)         = %" PRIu64 "\n", g_global.total_rejected_uninit);
+    printf("  -2  (closed/destroying)  = %" PRIu64 "\n", g_global.total_rejected_closed);
+    printf("  -3  (buffer full)        = %" PRIu64 "\n", g_global.total_rejected_full);
+    printf("Rotate calls               = %lu\n", g_rotate_call_count);
+    printf("Query calls (7 per iter)   = %lu\n", g_query_call_count);
+    printf("Destroy latency:\n");
+    printf("  max                      = %ld us (%.1f ms)\n",
+           g_global.max_destroy_latency_us,
+           g_global.max_destroy_latency_us / 1000.0);
+    printf("  avg                      = %ld us (%.1f ms)\n",
+           g_global.rounds_done ? g_global.sum_destroy_latency_us / g_global.rounds_done : 0,
+           g_global.rounds_done ? (g_global.sum_destroy_latency_us / g_global.rounds_done) / 1000.0 : 0.0);
+    printf("Phase B triggered (approx) = %d rounds (启发式: destroy_latency >= 80%% * wait_ms)\n",
+           g_global.phase_b_deferred_count);
+    printf("\nNo crash observed. Check log for 'destroy deferred' to confirm Phase B path.\n");
+    printf("Files under: ./stress_test/RYYYY_MM_DD/roundNNN/w_*.log\n");
     return 0;
 }
