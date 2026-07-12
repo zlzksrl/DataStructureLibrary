@@ -166,6 +166,11 @@ typedef struct T_FILEWRITERCONFIG
  * @details      创建目录/文件，初始化 StreamBuffer，
  *               用 ThreadManage 创建消费线程（SCHED_RR + 配置优先级）。
  *               可重入：多次 Init 创建独立实例。
+ *
+ *               **抗并发销毁**：Init 后本实例的 Write/WriteBin/Flush/Rotate/查询
+ *               接口支持与 Destroy 真并发（详见 Destroy 的 @details 与
+ *               config.destroy_wait_ms）。业务线程可以持有 fw 指针，即使
+ *               另一线程正在 Destroy 也不会 UAF——最坏情况是 Write 返回 -2。
  * @param[in]    pp:  句柄二级指针，调用前 *pp 必须为 NULL
  * @param[in]    cfg: 配置参数
  * @return       int ret

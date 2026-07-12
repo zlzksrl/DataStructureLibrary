@@ -33,10 +33,15 @@
 /* ========================== 测试配置 ========================== */
 
 #define STRESS_ROOT             "./stress_test"
-#define ROUNDS_NORMAL           20      /* 常规场景轮数 */
-#define ROUNDS_IMMEDIATE        10      /* 立即销毁的极端轮数 */
-#define WRITER_THREADS          4       /* 每轮的 Writer 线程数 */
-#define WRITE_BUFFER_SIZE       128     /* 每次 WriteBin 字节数 */
+
+/* 每类场景的轮数 */
+#define ROUNDS_NORMAL           50      /* 常规：Writer 充分跑 2-5s 再销毁 */
+#define ROUNDS_IMMEDIATE        30      /* 立即：Writer 刚起来就销毁 */
+#define ROUNDS_PHASE_B          30      /* Phase B 专项：极小 destroy_wait_ms */
+
+/* 每轮线程规模 */
+#define WRITER_THREADS          6       /* 每轮的 Writer 线程数 */
+#define WRITE_BUFFER_SIZE       256     /* 每次 WriteBin 字节数 */
 
 /* 全局共享句柄（业务线程访问）——刻意用共享指针模拟第三方框架把句柄传给多个线程的场景 */
 static T_FileWriter *g_fw          = NULL;
@@ -55,6 +60,29 @@ typedef struct
 } T_WorkerStats;
 
 static T_WorkerStats g_stats[WRITER_THREADS];
+
+/* 全局累计统计（所有轮次汇总） */
+typedef struct
+{
+    unsigned long long total_calls;
+    unsigned long long total_ok;
+    unsigned long long total_rejected_uninit;
+    unsigned long long total_rejected_closed;
+    unsigned long long total_rejected_full;
+    unsigned long long total_bytes_ok;         /* 估算：ok 次数 * 平均字节 */
+    unsigned long long total_rotate_calls;
+    unsigned long long total_query_calls;
+    long               max_destroy_latency_us;
+    long               sum_destroy_latency_us;
+    int                phase_b_deferred_count; /* Phase B 触发次数（依赖日志难以直接感知，这里用启发式：Destroy 耗时接近 wait_ms 才计入） */
+    int                rounds_done;
+} T_GlobalStats;
+
+static T_GlobalStats g_global;
+
+/* Rotate / Query 计数（跨轮累加，用于总结） */
+static volatile unsigned long g_rotate_call_count = 0;
+static volatile unsigned long g_query_call_count  = 0;
 
 /* ========================== 工具 ========================== */
 
@@ -306,9 +334,26 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* Phase B 专项：极小 destroy_wait_ms + Rotate 密集触发，
+     * 让 spin-wait 更容易超时，从而走 Phase B 兜底释放路径。
+     * 观察日志里应该出现 "destroy deferred" 才算测到位。 */
+    printf("\n\n----- Phase B trigger rounds -----\n");
+    for(round = 1; round <= 10; round++)
+    {
+        int delay_ms = 50 + rand() % 150;
+        int wait_ms  = 1 + rand() % 5;      /* 1-5ms，极短，几乎注定 Phase B */
+        if(run_one_round(ROUNDS_NORMAL + ROUNDS_IMMEDIATE + round,
+                         delay_ms, wait_ms) != 0)
+        {
+            printf("Phase B round %d FAILED, abort\n", round);
+            return 1;
+        }
+    }
+
     printf("\n\n==================== ALL PASSED ====================\n");
-    printf("Total rounds: %d\n", ROUNDS_NORMAL + ROUNDS_IMMEDIATE);
+    printf("Total rounds: %d\n", ROUNDS_NORMAL + ROUNDS_IMMEDIATE + 10);
     printf("No crash observed.\n");
     printf("Check ./stress_test/RYYYY_MM_DD/roundNNN/w_*.log for data integrity.\n");
+    printf("Look for 'destroy deferred' in the log above to confirm Phase B was exercised.\n");
     return 0;
 }

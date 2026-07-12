@@ -61,7 +61,9 @@
 #define FW_DEFAULT_FLUSH_MS         100
 #define FW_DEFAULT_THREAD_PRIORITY  20
 #define FW_DEFAULT_DESTROY_WAIT_MS  500     /* Destroy 等 in-flight Writer 出保护区的默认超时 */
-#define FW_DESTROY_POLL_US          100     /* Destroy spin-wait 的轮询步长(us) */
+#define FW_DESTROY_POLL_US          500     /* Destroy spin-wait 的轮询步长(us)。
+                                             * 500us 在响应性（ms 级）和 CPU 占用（相较 100us 降 5 倍）
+                                             * 之间平衡；IMX6ULL 单核场景下更友好。 */
 
 
 /* ================================================================== */
@@ -113,6 +115,11 @@ struct T_FILEWRITER
     atomic_int          destroying;                        /**< Destroy 已开始，新的保护区进入应拒绝 */
     atomic_int          destroy_pending;                   /**< Phase B：Destroy 已超时放弃等待，
                                                                 最后一个出保护区的 Writer 负责最终 free */
+    atomic_int          finalize_taken;                    /**< 释放权独占锁：0=可抢，1=已有人负责 fw_final_free。
+                                                                Destroy 和 Writer LEAVE 都用 CAS(0→1) 抢，
+                                                                抢到者独占执行 fw_final_free，另一方放弃。
+                                                                消除 Phase B 下 Destroy 复检 与 Writer LEAVE
+                                                                两条路径同时观察到"该由我释放"的 double-free race。 */
 
     /* ---- 统计信息（受 file_lock 保护） ---- */
     unsigned long       stat_bytes_written;                /**< 累计已写盘字节数（fwrite 成功计数） */

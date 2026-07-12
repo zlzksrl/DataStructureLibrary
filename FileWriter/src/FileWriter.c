@@ -29,7 +29,6 @@
  * @author      zlzksrl
  */
 #include "FileWriter_Main.h"
-#include "FileWriter_Maketime.h"
 
 
 /* ========================== 本文件内部前向声明 ========================== */
@@ -69,7 +68,10 @@ static void fw_final_free(T_FileWriter *fw);
  *   1. 快速检查 destroying —— Destroy 已开始，直接拒绝，不入保护区；
  *   2. fetch_add(ref_count, 1) 占位；
  *   3. 再次检查 destroying —— 若在 1) 与 2) 之间 Destroy 到来，
- *      回滚 ref_count 并可能触发 Phase B 兜底释放。
+ *      回滚 ref_count 并返回。（此处**无需**兜底 fw_final_free：
+ *      我们能到 fetch_add，说明第一次 load destroying=0；destroy_pending
+ *      在时序上一定晚于 destroying 变 1，故此刻 destroy_pending 必然=0，
+ *      LEAVE 分支的 CAS(finalize_taken) 不会被触发。）
  *
  * memory_order 说明：
  *   - fetch_add(acq_rel) 保证后续读到的 fw->sb/fp 是 Init 之后的可见值；
@@ -80,10 +82,7 @@ static void fw_final_free(T_FileWriter *fw);
         if(atomic_load_explicit(&(fw)->destroying, memory_order_acquire)) return (err); \
         atomic_fetch_add_explicit(&(fw)->ref_count, 1, memory_order_acq_rel); \
         if(atomic_load_explicit(&(fw)->destroying, memory_order_acquire)) { \
-            int _r = atomic_fetch_sub_explicit(&(fw)->ref_count, 1, memory_order_acq_rel); \
-            if(_r == 1 && atomic_load_explicit(&(fw)->destroy_pending, memory_order_acquire)) { \
-                fw_final_free(fw); \
-            } \
+            (void)atomic_fetch_sub_explicit(&(fw)->ref_count, 1, memory_order_acq_rel); \
             return (err); \
         } \
     } while(0)
@@ -92,14 +91,21 @@ static void fw_final_free(T_FileWriter *fw);
  * @brief  Writer 出保护区
  *
  * 若我是最后一个引用（fetch_sub 返回 1）且 destroy_pending 已置位，
- * 由我负责 Phase B 的最终释放（fw_final_free 内部会 destroy SB / mutex / free）。
- * 释放后 fw 指针不可再访问，所以本宏应放在函数 return 之前的最后一步。
+ * 用 CAS(finalize_taken, 0→1) **独占地**抢释放权；抢到才调 fw_final_free。
+ * CAS 失败说明 Destroy 侧已经抢先接管，我什么都不做（避免 double-free）。
+ *
+ * 释放后 fw 指针不可再访问，故本宏应放在函数 return 之前的最后一步。
  */
 #define FW_LEAVE_GUARD(fw) \
     do { \
         int _r = atomic_fetch_sub_explicit(&(fw)->ref_count, 1, memory_order_acq_rel); \
         if(_r == 1 && atomic_load_explicit(&(fw)->destroy_pending, memory_order_acquire)) { \
-            fw_final_free(fw); \
+            int _exp = 0; \
+            if(atomic_compare_exchange_strong_explicit( \
+                    &(fw)->finalize_taken, &_exp, 1, \
+                    memory_order_acq_rel, memory_order_acquire)) { \
+                fw_final_free(fw); \
+            } \
         } \
     } while(0)
 
@@ -251,8 +257,13 @@ static void fw_get_timestamp_str(char *out, int out_len)
 
 /**
  * @func         fw_date_changed_locked
- * @brief        检查日期是否变化（跨日检测），已变则更新 current_date
+ * @brief        检查日期是否变化（跨日检测），**只查询不更新**
  * @return       1=变化，0=未变化
+ * @details      与之前版本的区别：不再副作用性地更新 current_date。
+ *               当前 current_date 只在 rotate **成功后**才更新——由
+ *               `fw_check_daily_rotate_locked` 负责。
+ *               这样 rotate 失败时下次仍会重试跨日轮转，避免"跨日+rotate 失败"
+ *               导致 24h 数据全落到昨天目录、直到明天再次跨日才自愈的静默故障。
  * @warning      调用前须持有 fw->file_lock
  */
 static int fw_date_changed_locked(T_FileWriter *fw)
@@ -260,13 +271,7 @@ static int fw_date_changed_locked(T_FileWriter *fw)
     char today[FW_DATE_STR_LEN];
 
     fw_get_date_str(today, sizeof(today));
-    if(strcmp(today, fw->current_date) != 0)
-    {
-        strncpy(fw->current_date, today, sizeof(fw->current_date) - 1);
-        fw->current_date[sizeof(fw->current_date) - 1] = '\0';
-        return 1;
-    }
-    return 0;
+    return (strcmp(today, fw->current_date) != 0) ? 1 : 0;
 }
 
 /**
@@ -609,17 +614,44 @@ static int fw_check_file_size_rotate_locked(T_FileWriter *fw)
 
 /**
  * @func         fw_check_daily_rotate_locked
- * @brief        跨日检测：若跨日且开启 auto_rotate_daily 则轮转
+ * @brief        跨日检测：若跨日且开启 auto_rotate_daily 则轮转（含失败回滚）
+ * @details      设计要点：
+ *               - `fw_date_changed_locked` 已改成"只查询不更新"，本函数负责
+ *                 "先切 current_date、失败回滚"的事务性操作；
+ *               - rotate 内部 build_paths 使用 current_date 组装新目录，
+ *                 因此必须先把 current_date 切到今天，rotate 才会去创建"今天的目录"；
+ *               - rotate 失败（磁盘满/权限/目录创建失败）时，把 current_date
+ *                 回滚为昨天，让下次调用继续重试。避免 24h 静默故障。
  * @warning      调用前须持有 fw->file_lock
  */
 static int fw_check_daily_rotate_locked(T_FileWriter *fw)
 {
-    if(fw->config.auto_rotate_daily && fw_date_changed_locked(fw))
+    char today[FW_DATE_STR_LEN];
+    char saved_date[FW_DATE_STR_LEN];
+    int rc;
+
+    if(!fw->config.auto_rotate_daily)
     {
-        /* 跨日：序号继续递增（文件名含日期，同一日期目录下按 seq 顺序增长） */
-        return fw_rotate_locked(fw);
+        return 0;
     }
-    return 0;
+    if(!fw_date_changed_locked(fw))
+    {
+        return 0;
+    }
+
+    /* 暂存旧日期，切到今天做 rotate */
+    fw_get_date_str(today, sizeof(today));
+    memcpy(saved_date, fw->current_date, sizeof(saved_date));
+    strncpy(fw->current_date, today, sizeof(fw->current_date) - 1);
+    fw->current_date[sizeof(fw->current_date) - 1] = '\0';
+
+    rc = fw_rotate_locked(fw);
+    if(0 != rc)
+    {
+        /* 回滚 current_date，下次跨日检测仍会返回 1，继续重试 */
+        memcpy(fw->current_date, saved_date, sizeof(fw->current_date));
+    }
+    return rc;
 }
 
 
@@ -774,8 +806,6 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
         printf("dir_path/file_prefix empty ##%s->%d\n", __FUNCTION__, __LINE__);
         return -1;
     }
-    
-    printf("FileWriterLibVision = [%s]\n", FileWriter_PROJECT_MAKETIME);
 
     pt = (T_FileWriter *)malloc(sizeof(T_FileWriter));
     if(NULL == pt)
@@ -819,6 +849,7 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     atomic_init(&pt->ref_count, 0);
     atomic_init(&pt->destroying, 0);
     atomic_init(&pt->destroy_pending, 0);
+    atomic_init(&pt->finalize_taken, 0);
 
     /* 初始日期 & 序号 */
     fw_get_date_str(pt->current_date, sizeof(pt->current_date));
@@ -1010,12 +1041,23 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
         }
     }
 
-    /* A7. 归零：干净路径，直接释放 */
+    /* A7. 归零：干净路径。仍然要用 CAS 抢释放权——理论上 destroy_pending 尚未置位，
+     *     没有 Writer 会去调 fw_final_free，但为一致性和防御性，这里也用 CAS。 */
     ref_left = atomic_load_explicit(&pt->ref_count, memory_order_acquire);
     if(0 == ref_left)
     {
+        int expected = 0;
+        if(atomic_compare_exchange_strong_explicit(
+                &pt->finalize_taken, &expected, 1,
+                memory_order_acq_rel, memory_order_acquire))
+        {
+            *pp = NULL;
+            fw_final_free(pt);
+            return 0;
+        }
+        /* 走到这里说明有 Writer 抢先 CAS 成功——但这几乎不可能：
+         * destroy_pending 未置位，LEAVE 侧的 CAS 分支进不去。留作防御。 */
         *pp = NULL;
-        fw_final_free(pt);
         return 0;
     }
 
@@ -1024,18 +1066,27 @@ int FileWriterAPI_Destroy(T_FileWriter **pp)
     /* B1. 置 destroy_pending=1（release），保证 Writer 侧后续 acquire load 能看到 */
     atomic_store_explicit(&pt->destroy_pending, 1, memory_order_release);
 
-    /* B2. 再检查一次：可能在 A7 判断后、置 destroy_pending 前，
-     *     Writer 已经完成 fetch_sub 归 0——若我们不检查，就没人兜底了。
-     *     此时应由本函数直接兜底释放。 */
+    /* B2. 再检查一次：可能 A7 与 B1 之间 Writer 已 fetch_sub 归 0。
+     *     此时 Writer LEAVE 时 load(destroy_pending) 还是 0（B1 尚未 store），
+     *     不会去调 fw_final_free。若此处不检查+兜底 CAS，就没人释放了。 */
     ref_left = atomic_load_explicit(&pt->ref_count, memory_order_acquire);
     if(0 == ref_left)
     {
+        int expected = 0;
+        if(atomic_compare_exchange_strong_explicit(
+                &pt->finalize_taken, &expected, 1,
+                memory_order_acq_rel, memory_order_acquire))
+        {
+            *pp = NULL;
+            fw_final_free(pt);
+            return 0;
+        }
+        /* CAS 失败：Writer LEAVE 抢先（B1 之后 Writer 才 LEAVE 且看到 destroy_pending=1） */
         *pp = NULL;
-        fw_final_free(pt);
         return 0;
     }
 
-    /* B3. 交给最后一个出保护区的 Writer 兜底。
+    /* B3. 交给最后一个出保护区的 Writer 兜底（LEAVE 侧 CAS 保证独占）。
      *     文件数据已在 A4 落盘，实例内存延迟释放，业务视角 *pp=NULL 已"归还"。 */
     printf("FileWriter [%s] destroy deferred: %d writer(s) still in flight, "
            "will free when last exits ##%s->%d\n",
