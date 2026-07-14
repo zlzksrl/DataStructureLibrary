@@ -29,6 +29,8 @@
 #include <pthread.h>
 #include <time.h>
 
+#include <FileWriter.h>
+
 #include "../include/SoftTimer.h"
 #include "../src/SoftTimer_Main.h"    /* 仅测试用：读 ST_DEBUG_DISPATCH_DELAY_MS */
 #include "../src/SoftTimer_Maketime.h"
@@ -708,7 +710,15 @@ static void demo_path_c(T_SoftTimerMgr *mgr)
     print_stats(mgr, "after Part 8");
 }
 
-
+static void FileWriter_cb(T_SoftTimerHandle *h, void *arg)
+{
+    (void)h;
+    T_FileWriter *pt_FileWriterHandle = (T_FileWriter *)arg;
+    static int count = 0;
+    FileWriterAPI_Write(pt_FileWriterHandle,"count = [%d]_%s->%d \r\n",count,__FUNCTION__,__LINE__);
+    printf("count = [%d]_%s->%d \r\n",count,__FUNCTION__,__LINE__);
+    count++;
+}
 /* ================================================================== */
 /*                                                                    */
 /*     main                                                           */
@@ -797,5 +807,39 @@ int main(int argc, char **argv)
     printf("=========================================================\n");
     printf(" SoftTimer demo done\n");
     printf("=========================================================\n");
+    //设置定时器写日志
+
+    T_SoftTimerMgr *pt_SoftTimerMgr = NULL;
+    T_SoftTimerConfig t_SoftTimerConfig = {"FileWriter",2,8,64,2000,0};
+    r = SoftTimerAPI_Init(&pt_SoftTimerMgr, t_SoftTimerConfig);
+
+    T_FileWriter *pt_FileWriterHandle = NULL;
+    T_FileWriterConfig t_FileWriterConfig;
+    memset(&t_FileWriterConfig, 0, sizeof(T_FileWriterConfig));
+    snprintf(t_FileWriterConfig.dir_path, 256, "./TimerFile/");
+    strncpy(t_FileWriterConfig.date_subdir_prefix, "X",16);
+    strncpy(t_FileWriterConfig.file_prefix,"TimerFile", 64);
+    t_FileWriterConfig.file_type       = FILEWRITER_TYPE_TXT;
+    t_FileWriterConfig.thread_priority = 20;
+    t_FileWriterConfig.timestamp       = 1;
+    t_FileWriterConfig.flush_bytes     = 512*1024;
+    t_FileWriterConfig.flush_ms        = 3*1000;
+    t_FileWriterConfig.buffer_capacity = 1*1024*1024;
+    if(FileWriterAPI_Init(&pt_FileWriterHandle, &t_FileWriterConfig) != 0)
+    {
+        Debug_printx("Init fail");
+        return 0;
+    }
+    T_SoftTimerAlarm t_SoftTimerAlarm = {FileWriter_cb,pt_FileWriterHandle,200,200,SOFTTIMER_PERIOD_FROM_END,"Test_FileWriter"};
+    T_SoftTimerHandle *pt_SoftTimerHandle = NULL;
+    r = SoftTimerAPI_SetAlarm(pt_SoftTimerMgr, t_SoftTimerAlarm, &pt_SoftTimerHandle);
+
+    while(1)
+    {
+
+
+        sleep(1);
+    }
+
     return 0;
 }

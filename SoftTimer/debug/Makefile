@@ -40,6 +40,13 @@ ThreadQueue_LIBINCPATH		= -I $(LIBFILE_PATH)/ThreadQueue/include
 ThreadManage_LIBPATH		= -L $(LIBFILE_PATH)/ThreadManage/StaticLib
 ThreadManage_LIBINCPATH		= -I $(LIBFILE_PATH)/ThreadManage/include
 
+#测试-main
+StreamBuffer_LIBPATH		= -L $(LIBFILE_PATH)/StreamBuffer/StaticLib
+StreamBuffer_LIBINCPATH		= -I $(LIBFILE_PATH)/StreamBuffer/include
+
+FileWriter_LIBPATH		= -L $(LIBFILE_PATH)/FileWriter/StaticLib
+FileWriter_LIBINCPATH		= -I $(LIBFILE_PATH)/FileWriter/include
+
 # ==============================================================================
 # 编译选项
 # ==============================================================================
@@ -52,6 +59,8 @@ CFLAGS  := $(CFLAGS) -pthread
 CFLAGS  := $(CFLAGS) $(KernelLinkedList_LIBINCPATH)
 CFLAGS  := $(CFLAGS) $(RedBlackTree_LIBINCPATH)
 CFLAGS  := $(CFLAGS) $(ThreadQueue_LIBINCPATH)
+CFLAGS  := $(CFLAGS) $(StreamBuffer_LIBINCPATH)
+CFLAGS  := $(CFLAGS) $(FileWriter_LIBINCPATH)
 CFLAGS  := $(CFLAGS) $(ThreadManage_LIBINCPATH)
 
 # 位置无关代码编译选项（动态库必需）
@@ -62,6 +71,10 @@ LDFLAGS = -pthread
 LDFLAGS := $(LDFLAGS) -lrt
 LDFLAGS := $(LDFLAGS) $(ThreadManage_LIBPATH)
 LDFLAGS := $(LDFLAGS)  -lThreadManage
+LDFLAGS := $(LDFLAGS) $(FileWriter_LIBPATH)
+LDFLAGS := $(LDFLAGS)  -lFileWriter
+LDFLAGS := $(LDFLAGS) $(StreamBuffer_LIBPATH)
+LDFLAGS := $(LDFLAGS)  -lStreamBuffer
 LDFLAGS := $(LDFLAGS) $(ThreadQueue_LIBPATH)
 LDFLAGS := $(LDFLAGS)  -lThreadQueue
 LDFLAGS := $(LDFLAGS) $(RedBlackTree_LIBPATH)
