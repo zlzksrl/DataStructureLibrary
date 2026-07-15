@@ -50,9 +50,9 @@
  *                                           .ePeriodMode=SOFTTIMER_PERIOD_FROM_END,
  *                                           .sTimerName="tick" };
  *                SoftTimerAPI_SetAlarm(mgr, a, &h);
- *                // ... 业务运行 ... 
- *                SoftTimerAPI_Delete(mgr, &h);      // h 被置 NULL 
- *                SoftTimerAPI_Destroy(&mgr);        // mgr 被置 NULL 
+ *                //... 业务运行 ... 
+ *                SoftTimerAPI_Delete(mgr, &h);       //h 被置 NULL 
+ *                SoftTimerAPI_Destroy(&mgr);         //mgr 被置 NULL 
  *
  *              极端资源不足行为:
  *                周期定时器在 wrapper 收尾时需将 node 重新压入堆（heap_ensure_capacity

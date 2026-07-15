@@ -808,11 +808,11 @@ int main(int argc, char **argv)
     printf(" SoftTimer demo done\n");
     printf("=========================================================\n");
     //设置定时器写日志
-
+    sleep(10);
     T_SoftTimerMgr *pt_SoftTimerMgr = NULL;
     T_SoftTimerConfig t_SoftTimerConfig = {"FileWriter",2,8,64,2000,0};
     r = SoftTimerAPI_Init(&pt_SoftTimerMgr, t_SoftTimerConfig);
-
+    sleep(5);
     T_FileWriter *pt_FileWriterHandle = NULL;
     T_FileWriterConfig t_FileWriterConfig;
     memset(&t_FileWriterConfig, 0, sizeof(T_FileWriterConfig));
@@ -830,6 +830,7 @@ int main(int argc, char **argv)
         Debug_printx("Init fail");
         return 0;
     }
+    sleep(5);
     T_SoftTimerAlarm t_SoftTimerAlarm = {FileWriter_cb,pt_FileWriterHandle,200,200,SOFTTIMER_PERIOD_FROM_END,"Test_FileWriter"};
     T_SoftTimerHandle *pt_SoftTimerHandle = NULL;
     r = SoftTimerAPI_SetAlarm(pt_SoftTimerMgr, t_SoftTimerAlarm, &pt_SoftTimerHandle);

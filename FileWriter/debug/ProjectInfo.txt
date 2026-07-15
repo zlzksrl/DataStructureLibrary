@@ -1,4 +1,4 @@
-PROJECT_MAKETIME zlzksrl-1.1.0 at 2026.07.13-00.08.40 libFileWriter.a
-fbff125f43d24bbc08e7c3f93e494cfa  libFileWriter.a
-PROJECT_MAKETIME zlzksrl-1.1.0 at 2026.07.13-00.08.40 libFileWriter.so
-f013c8f44fe75e9fabfadbfbd7f1f067  libFileWriter.so
+PROJECT_MAKETIME zlzksrl-1.2.0 at 2026.07.15-21.21.20 libFileWriter.a
+83e1817b4d60d2e5cecf30140a4189df  libFileWriter.a
+PROJECT_MAKETIME zlzksrl-1.2.0 at 2026.07.15-21.21.20 libFileWriter.so
+df71005a8e2a053c6421406c04a40592  libFileWriter.so

@@ -62,6 +62,8 @@
 #ifndef __MemoryPool_H__
 #define __MemoryPool_H__
 
+#include <stdint.h>          /* uint64_t */
+
 #ifdef __cplusplus
  extern "C" {
 #endif
@@ -106,19 +108,27 @@ typedef struct T_MEMPOOLCONFIG
     int         init_count;    /**< 初始槽位数。默认 64。0=用默认。 */
     MemPoolMode mode;          /**< Alloc() 默认模式(DROP/GROW/BLOCK) */
     int         grow_count;    /**< GROW 每次扩容新增槽位数；mode=MEMPOOL_MODE_GROW 时必须 >0，否则 Init 失败 */
-    int         block_timeo;   /**< BLOCK 模式默认阻塞超时(ms)，Alloc() 使用；0=无限等待，>0 超时返 NULL */
+    int         block_timeo;   /**< BLOCK 模式默认阻塞超时(ms)，Alloc() 使用；0=无限等待，>0 超时返 NULL。负值 Init 失败。 */
+    int         max_count;     /**< GROW 扩容槽位数上限（含 init_count）。
+                                *  - **max_count < init_count**：**无上限**（可无限扩容，直到 malloc 失败）
+                                *  - **max_count >= init_count**：总槽位数不超过 max_count；
+                                *    到达上限后 GROW 自动退化为 DROP 行为（返回 NULL 并 total_drop++）；
+                                *    扩容会尽量填满（若 grow_count > 剩余额度，则按剩余额度扩容）
+                                *  仅对 GROW 模式与显式 AllocGrow 有意义；DROP/BLOCK 池忽略此字段。
+                                */
 } T_MemPoolConfig;
 
 /**
  * @struct       T_MemPoolStats
  * @brief        内存池运行统计信息
+ * @details      计数器为 64 位无符号整数，即便高频调用（>1M 次/秒）也数千年不回绕。
  */
 typedef struct T_MEMPOOLSTATS
 {
-    unsigned long ulTotalAlloc;   /**< 累计 Alloc 成功次数 */
-    unsigned long ulTotalFree;    /**< 累计 Free 归还次数 */
-    unsigned long ulTotalDrop;    /**< 累计返回NULL次数：DROP池满 + BLOCK超时 + GROW扩容失败 */
-    unsigned long ulTotalGrow;    /**< 累计 GROW 扩容槽位数 */
+    uint64_t      ulTotalAlloc;   /**< 累计 Alloc 成功次数 */
+    uint64_t      ulTotalFree;    /**< 累计 Free 归还次数 */
+    uint64_t      ulTotalDrop;    /**< 累计返回NULL次数：DROP池满 + BLOCK超时 + GROW扩容失败 + GROW达 max_count 上限 + Destroy 唤醒时的 BLOCK 等待者 */
+    uint64_t      ulTotalGrow;    /**< 累计 GROW 扩容槽位数（不含 init_count） */
     int           iPeakUsed;      /**< 峰值已用槽位数 */
     int           iCapacity;      /**< 总容量(含 GROW 扩容，槽位数) */
 } T_MemPoolStats;
@@ -143,17 +153,27 @@ typedef struct T_MEMPOOLSTATS
  *               校验规则（不满足返回 -1）：
  *               - *pp 必须为 NULL；
  *               - element_size > 0、init_count > 0；
- *               - mode = MEMPOOL_MODE_GROW 时 grow_count 必须 >0。
+ *               - mode 必须为 DROP/GROW/BLOCK 之一；
+ *               - mode = MEMPOOL_MODE_GROW 时 grow_count 必须 >0；
+ *               - block_timeo 必须 >= 0（负值直接拒绝，避免误配置导致静默无限阻塞）；
+ *               - init_count × align_size 不得溢出 size_t。
+ *
+ *               max_count 语义：
+ *               - max_count < init_count（含 <=0）：无上限，可无限扩容直至 malloc 失败；
+ *               - max_count >= init_count：总容量不超过 max_count；到达上限后 GROW
+ *                 自动退化为 DROP（返回 NULL 并累加 total_drop）。
  * @param[in]    pp:   句柄二级指针，*pp 必须为 NULL
  * @param[in]    cfg:  配置参数，可为 NULL(用默认)
  * @param[in]    name: 名称，调试日志用
  * @return       int ret
  * @retval       0:   初始化成功
- * @retval       -1:  参数无效、内存分配失败、*pp 非空、或 GROW 模式 grow_count<=0
+ * @retval       -1:  参数无效（pp/name 为 NULL、*pp 非空）、mode 非法、
+ *                    GROW 模式 grow_count<=0、grow_count<0、block_timeo<0、
+ *                    element_size 越界、乘法溢出、内存分配失败或 pthread 原语初始化失败
  * @warning      pp 不能为 NULL，*pp 必须为 NULL
  * @author       zlzksrl
- * @date         2026-07-10
- * @Version      V1.0.0
+ * @date         2026-07-12
+ * @Version      V1.1.0
  */
 int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name);
 
@@ -161,7 +181,7 @@ int MemPoolAPI_Init(T_MemPool **pp, const T_MemPoolConfig *cfg, const char *name
  * @func         MemPoolAPI_Destroy
  * @brief        内存池API-销毁，释放所有资源
  * @details      释放所有 chunk 内存（含 GROW 扩容的）、销毁 mutex/cond、释放结构体，
- *               将 *pp 置 NULL。幂等：*pp==NULL 返回 -1。
+ *               将 *pp 置 NULL。可重复调用（重复销毁 *pp==NULL 时返回 -1，不崩溃）。
  * @warning      调用前需确保所有 Alloc 出的槽位都已 Free 归还（否则用户持有已释放内存，
  *               属调用者责任）；并确保无其它线程正在访问。
  * @param[in]    pp: 句柄二级指针
@@ -223,11 +243,17 @@ void *MemPoolAPI_AllocDrop(T_MemPool *p);
  * @brief        内存池API-分配(满则动态扩容，显式 GROW)
  * @details      池满时 malloc 新 chunk(grow_count 个槽位)串入空闲链表，再分配。
  *               适合"不能丢、内存可增长"场景。返回内存未初始化。
+ *
+ *               **调用前提**：Init 时必须设置 `grow_count > 0`（即便 `cfg.mode != GROW`），
+ *               否则本函数在池满时始终失败并计入 total_drop。
+ *
+ *               若 Init 时设置了 `max_count >= init_count`：到达上限后返回 NULL 并
+ *               计入 total_drop（同 DROP 行为）。
  * @param[in]    p: 句柄
- * @return       void* 槽位首地址；NULL=扩容失败(grow_count<=0 或 malloc 失败)或参数无效
+ * @return       void* 槽位首地址；NULL=扩容失败(grow_count<=0 或 malloc 失败 或 达 max_count 上限)或参数无效
  * @author       zlzksrl
- * @date         2026-07-10
- * @Version      V1.0.0
+ * @date         2026-07-12
+ * @Version      V1.1.0
  */
 void *MemPoolAPI_AllocGrow(T_MemPool *p);
 
