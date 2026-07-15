@@ -1,9 +1,9 @@
 # FileWriter 异步文件写入模块（日志 / CSV / 二进制记录）
 
-> **项目版本**: V1.1.0 | **作者**: zlzksrl | **许可证**: AGPL-3.0
+> **项目版本**: V1.2.0 | **作者**: zlzksrl | **许可证**: AGPL-3.0
 > **目标平台**: IMX6ULL (ARM Linux) | **语言**: C11（依赖 `<stdatomic.h>`）
 > **命名规范**: `FileWriterAPI_*`
-> **创建日期**: 2026-07-11 | **本次更新**: 2026-07-12（V1.1 抗并发销毁）
+> **创建日期**: 2026-07-11 | **本次更新**: 2026-07-15（V1.2 序号跨重启延续 + 降配批量清理）
 
 ---
 
@@ -66,11 +66,11 @@ FileWriter/
 │   └── FileWriter_Maketime.h         # Makefile 生成的版本时间戳（不手写）
 ├── debug/
 │   ├── main.c                        # 7 段功能演示：LOG/CSV/BIN/多实例/Rotate/查询/工具函数
-│   ├── stress_test.c                 # 抗并发销毁高压测试（V1.1 引入）
+│   ├── stress_test.c                 # 抗并发销毁高压测试（V1.1 引入）+ Stage 4 功能断言（V1.2）
 │   ├── Makefile                      # 交叉编译（arm-linux-gnueabihf-gcc）
 │   └── ProjectInfo.txt               # 编译产物 MD5 记录（Makefile 生成）
 ├── 需求文档.md                        # 原始需求与设计决策
-├── AI审查结果.md                      # 五轮代码审查记录
+├── AI审查结果.md                      # 六轮代码审查记录（V1.0-V1.2）
 └── readme.md                         # 本文件
 ```
 
@@ -205,7 +205,7 @@ typedef struct T_FILEWRITERCONFIG
     char     file_ext[16];           // 非空覆盖默认扩展名
 
     /* 文件轮转 */
-    int      max_files;              // 0=无限制；>0 超过删最老（按文件名字典序=时间序）
+    int      max_files;              // [0,999]，越界 Init 拒绝；0=无限制；1..999=超过删最老（字典序=时间序）
     int      max_file_size;          // 0=不限制；>0 达此大小自动轮转（字节）
     int      auto_rotate_daily;      // 1=跨日自动轮转
 
@@ -249,6 +249,10 @@ typedef struct T_FILEWRITERCONFIG
 {file_prefix 的文件名部分}_{seq3位}_{YYYY-MM-DD-HH-MM-SS}.{ext}
 ```
 
+- **seq 范围**：`000-999`，rotate 到 `999` 后回绕到 `000`（`(seq+1) % 1000`）。
+- **唯一性**：文件名尾部的秒级时间戳承担唯一性，seq 只做人眼可读的递增编号。
+- **跨重启延续（V1.2）**：Init 时扫描 `current_dirpath` 下所有 `{prefix_name}_NNN_*` 文件，取 `max_seq`，新文件从 `(max_seq+1) % 1000` 开始编号。目录空则从 `000` 起。这样重启后不会又从 `000` 开始覆盖/共存旧文件，日志检索时序更清晰。
+
 **示例**：
 
 | 配置 | 生成的文件名 | 完整路径 |
@@ -276,8 +280,14 @@ typedef struct T_FILEWRITERCONFIG
 
 ### 删旧策略
 
-- `max_files > 0`：每次 Rotate 后遍历当前目录，匹配 `{prefix_name}_` 开头的文件，按文件名字典序（= 时间序）删最老，跳过当前正在写的文件。
-- `max_files == 0`：无限制。
+- **`max_files == 0`**：无限制，不做任何 opendir/删除，只在 Init 扫一次 `max_seq` 用于跨重启延续。
+- **`max_files ∈ [1, 999]`**：每次 Rotate 后 + Init 结束时执行一次清理：
+  - 单次 `opendir + readdir` 收集匹配 `{prefix_name}_` 开头的文件（跳过当前正写的）；
+  - `qsort` 字典序升序（seq 未 wrap 时字典序 == 时间序）；
+  - `excess = count + 1 - max_files`；从最老开始批量 `remove` 掉 `excess` 个。
+- **`max_files < 0` 或 `> 999`**：Init 直接拒绝返回 -1。上限 999 与 seq wrap 边界对齐，避免 wrap 后字典序与时间序错位、误删新文件。
+
+**降配启动场景（V1.2）**：上次运行 `max_files=999` 留下 900 个文件，本次 `max_files=100`。Init 一次遍历 + 一次排序 + 批量 remove 掉最老的 800 个（保留最新 99 个 + 本次新开的 1 个）。相比 V1.1 早期实现的每删一个都 opendir/readdir 一遍的 O(N²) 循环（20-60 秒卡死），V1.2 降到 1-3 秒。
 
 ---
 
@@ -401,7 +411,7 @@ make stress                   # 仅构建高压测试程序
 | `libFileWriter.a` | 静态库 |
 | `libFileWriter.so` | 动态库（-fPIC） |
 | `FileWriter_DebugPro.bin` | 功能演示（`main.c`，链接静态库） |
-| `FileWriter_Stress.bin` | 抗并发销毁高压测试（`stress_test.c`，V1.1） |
+| `FileWriter_Stress.bin` | 抗并发销毁高压测试（`stress_test.c`，V1.1）+ Stage 4 功能断言（V1.2：参数校验 / seq wrap / 跨重启延续 / 降配批量清理） |
 | `ProjectInfo.txt` | MD5 记录 |
 | `../src/FileWriter_Maketime.h` | 版本时间戳（Makefile 生成，勿手改） |
 
@@ -508,7 +518,7 @@ void sig_handler(int) { g_stop = 1; }
 /* 或者更激进：直接在其他线程调 Destroy，业务线程会拿到 -2，安全退出。 */
 ```
 
-**压力验证**：`debug/stress_test.c` 110 轮多线程高压销毁测试（900 万+ Write / 30 轮专项 Phase B）在 IMX6ULL 上零崩溃通过。
+**压力验证**：`debug/stress_test.c` 110 轮多线程高压销毁测试（900 万+ Write / 30 轮专项 Phase B） + Stage 4 功能断言（V1.2：参数校验 / seq wrap / 跨重启延续 / 降配批量清理）在 IMX6ULL 上零崩溃通过。
 
 ---
 
@@ -536,10 +546,16 @@ A: 完全独立。每个实例有自己的 StreamBuffer、消费线程、file_lo
 A: 超长部分被截断（`vsnprintf` 返回值检查），不越界。若确实需要长日志，改 `FW_FORMAT_BUF_SIZE` 宏（`FileWriter_Main.h`）并重新编译库。
 
 **Q7: 支持 fsync 吗（真落盘到 flash）？**
-A: 当前只做 `fflush`（stdio buffer → kernel）。若需真正 flush 到 flash：V1.2 计划加 `fsync_ms` 配置字段。断电风险高的场景可暂时用 `Flush → sleep → Destroy` 组合。
+A: 当前只做 `fflush`（stdio buffer → kernel）。若需真正 flush 到 flash：V1.3 计划加 `fsync_ms` 配置字段。断电风险高的场景可暂时用 `Flush → sleep → Destroy` 组合。
 
 **Q8: 文件名冲突会覆盖吗？**
-A: 极端场景下会（同实例同秒 seq 相同、跨实例同一路径同前缀）。同实例内 seq 递增天然避免；跨实例请配不同 `file_prefix` 或 `dir_path`。
+A: 极端场景下会（同实例同秒 seq 相同、跨实例同一路径同前缀）。同实例内 seq 递增（V1.2 起跨重启也延续，避免重启后从 000 起冲撞）；跨实例请配不同 `file_prefix` 或 `dir_path`。
+
+**Q8.1: seq 到 999 后怎么办？(V1.2)**
+A: 回绕到 000。文件名尾部有秒级时间戳，重号不撞文件。`max_files` 上限就是 999（与 wrap 边界对齐）——超过 999 时字典序会与时间序错位、误删新文件，Init 会直接拒绝。要保留更多历史文件请用日期子目录（`date_subdir_prefix`）跨天分层。
+
+**Q8.2: 我把 max_files 从 999 改成 100 重启程序，会怎样？(V1.2)**
+A: Init 阶段一次性剪掉最老的（`count + 1 - 100`）个文件，保留最新的 99 个 + 新开的 1 个。算法：一次 `opendir + readdir` + `qsort` + 批量 `remove`，800 个文件在 IMX6ULL eMMC 上大约 1-3 秒。相较早期 V1.1 的 O(N²) 循环删（每删一个都要重新 `opendir`）能提速 20-30 倍。
 
 **Q9: 业务线程还在 Write 时能调 Destroy 吗？(V1.1)**
 A: **可以**。Destroy 与任何业务 API 并发安全。业务线程正在写的调用最坏返回 -2（destroying），之后的调用同样返回 -2。库内部通过 atomic 引用计数保护，无 UAF、无 double-free。见"十、并发与生命周期"。
@@ -558,8 +574,9 @@ A: 有界。默认最长 `destroy_wait_ms`（500ms） + 消费线程 drain SB + 
 |---|---|---|
 | V1.0.0 | 2026-07-11 | 首版发布：核心 API + 事务性 Rotate + drain-before-rotate + Stats API |
 | V1.1.0 | 2026-07-12 | **抗并发销毁**：atomic 引用计数 + CAS 独占释放权 + 两阶段销毁（Phase A 同步 / Phase B 延迟）；跨日 rotate 失败可自愈；配置字段 `destroy_wait_ms`；`debug/stress_test.c` 高压测试；`-std=gnu11`（依赖 `<stdatomic.h>`） |
+| V1.2.0 | 2026-07-15 | **序号跨重启延续 + 降配批量清理**：Init 扫描同前缀 `max_seq`，`file_seq = (max_seq+1) % 1000`，避免重启后 seq 又从 000 开始；rotate 增量 `%1000`（seq 只在 000-999 循环，重号靠文件名秒级时间戳区分）；`max_files` 范围校验 `[0, 999]`，越界 Init 拒绝；降配启动（如 900→100）用"单次遍历 + qsort + 批量 remove"替代原 O(N²) 循环，800 个文件从 20-60 秒缩到 1-3 秒；`stress_test.c` 新增 Stage 4（4 项功能断言：参数校验 / seq wrap / 跨重启延续 / 降配批量清理） |
 
-### V1.2 计划（后续迭代）
+### V1.3 计划（后续迭代）
 
 - `FileWriterAPI_StatsReset` — 清零累计计数器
 - `FileWriterAPI_FlushSync(fw, timeout_ms)` — 同步等待落盘

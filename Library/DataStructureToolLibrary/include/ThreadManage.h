@@ -6,7 +6,7 @@
  * @author      zlzksrl
  * @Version     V1.0.1
  * @date        2025-10-01
- * @copyright   copyright (C) 2024
+ * @copyright   copyright (C) 2025
  */
  
 /**
@@ -24,55 +24,55 @@
 
 #include <pthread.h>
 
-//线程函数原型
+/* 线程函数原型 */
 typedef void *(*ThreadFunctionType)(void *pThreadFuncUserArg);
 
-//线程创建配置
+/* 线程创建配置 */
 typedef struct
 {
-    //1、配置线程函数及参数
+    /* 1、配置线程函数及参数 */
     ThreadFunctionType pThreadFunc;
     void *pThreadFuncUserArg;
 
-    //2、配置线程名称
-    const char *sThreadName;
+    /* 2、配置线程名称 */
+    char *sThreadName;
 
-    //3、是否配置线程属性
+    /* 3、是否配置线程属性 */
     int eSetAttr;
-    //0 == eSetAttr:不配置线程属性，使用默认值
-    //1 == eSetAttr:配置线程属性，但只配置栈大小
-    //2 == eSetAttr:配置线程以下所有属性
-    
-    //4、配置栈大小 1-32
+    /* 0 == eSetAttr:不配置线程属性，使用默认值 */
+    /* 1 == eSetAttr:配置线程属性，但只配置栈大小 */
+    /* 2 == eSetAttr:配置线程以下所有属性 */
+
+    /* 4、配置栈大小 1-32 */
     int istacksize_MB;
-    
-    //5、配置分离状态
+
+    /* 5、配置分离状态 */
     int eDetachState;
-    //(1)PTHREAD_CREATE_JOINABLE:（默认值）线程执行完函数后不会自行释放资源；
-    //(2)PTHREAD_CREATE_DETACHED:线程执行完函数后，会自行终止并释放占用的资源。
+    /* (1)PTHREAD_CREATE_JOINABLE:（默认值）线程执行完函数后不会自行释放资源； */
+    /* (2)PTHREAD_CREATE_DETACHED:线程执行完函数后，会自行终止并释放占用的资源。 */
 
-    //6、配置继承策略
+    /* 6、配置继承策略 */
     int einheritsched;
-    //(1)PTHREAD_INHERIT_SCHED :新线程将忽略 attr 中设置的调度策略和参数，继承创建者线程的调度属性
-    //(2)PTHREAD_EXPLICIT_SCHED:新线程使用 attr 中显式设置的调度策略和参数
+    /* (1)PTHREAD_INHERIT_SCHED :新线程将忽略 attr 中设置的调度策略和参数，继承创建者线程的调度属性 */
+    /* (2)PTHREAD_EXPLICIT_SCHED:新线程使用 attr 中显式设置的调度策略和参数 */
 
-    //7、配置调度策略与优先级----einheritsched 设置为 PTHREAD_EXPLICIT_SCHED 有用
-    int	eSchedPolicy;//线程调度策略
-    //(1)SCHED_OTHER :(默认值)：普通策略(分时调度算法)，按照优先级调度,是动态优先级，不支持设置优先级
-    //(2)SCHED_FIFO  :先进先出。一个FIFO会持续执行，直到线程阻塞、结束、有更高优先级的线程就绪
-    //(3)SCHED_RR    :轮转策略。给每个线程分配执行时间(时间片)，当一个线程的时间片耗尽时，下一个线程执行
-    //以下是Linux特有
-    //(4)SCHED_BATCH :批处理调度策略（Linux 特有） 适合非交互式、CPU 密集型任务
-    //(5)SCHED_IDLE  :低优先级调度策略（Linux 特有）  仅在系统空闲时运行，优先级极低
-    
-    //8、配置优先级-----------einheritsched 设置为 PTHREAD_EXPLICIT_SCHED 有用
+    /* 7、配置调度策略与优先级----einheritsched 设置为 PTHREAD_EXPLICIT_SCHED 有用 */
+    int eSchedPolicy;              /* 线程调度策略 */
+    /* (1)SCHED_OTHER :(默认值)：普通策略(分时调度算法)，按照优先级调度,是动态优先级，不支持设置优先级 */
+    /* (2)SCHED_FIFO  :先进先出。一个FIFO会持续执行，直到线程阻塞、结束、有更高优先级的线程就绪 */
+    /* (3)SCHED_RR    :轮转策略。给每个线程分配执行时间(时间片)，当一个线程的时间片耗尽时，下一个线程执行 */
+    /* 以下是Linux特有 */
+    /* (4)SCHED_BATCH :批处理调度策略（Linux 特有） 适合非交互式、CPU 密集型任务 */
+    /* (5)SCHED_IDLE  :低优先级调度策略（Linux 特有）  仅在系统空闲时运行，优先级极低 */
+
+    /* 8、配置优先级-----------einheritsched 设置为 PTHREAD_EXPLICIT_SCHED 有用 */
     int iSchedPriority;
-    //调度优先级1-99，数值越大优先级越高（当 eSchedPolicy 为 SCHED_FIFO/SCHED_RR 模式有用）
+    /* 调度优先级1-99，数值越大优先级越高（当 eSchedPolicy 为 SCHED_FIFO/SCHED_RR 模式有用） */
 
-    //以下内部使用，用户无需设置
-    pthread_attr_t *pt_ThreadAttr; //线程属性
-    pthread_t tThreadPid;       //线程PID
-    struct timespec interval;   //时间片（仅仅SCHED_RR模式）
+    /* 以下内部使用，用户无需设置 */
+    pthread_attr_t *pt_ThreadAttr;   /* 线程属性 */
+    pthread_t tThreadPid;            /* 线程PID */
+    struct timespec interval;        /* 时间片（仅仅SCHED_RR模式） */
 }T_ThreadCreateConfig;
 
 typedef struct  T_THREADPOOLHANDLE T_ThreadPoolHandle; 
@@ -152,10 +152,10 @@ int ThreadAPI_PrintThreadAttr(const char *sThreadName,pthread_t tThreadPid);
 
 typedef struct  T_THREADPOOLCONFIG
 {
-    int iMinNum;//线程池最小数量
-    int iMaxNum;//线程池最大数量
-    int iQueueMaxSize;//任务队列中最大的任务个数
-    int iIdleTimeoutMs;//空闲线程超时缩容时间(ms)，0=禁用缩容
+    int iMinNum;         /* 线程池最小数量 */
+    int iMaxNum;         /* 线程池最大数量 */
+    int iQueueMaxSize;   /* 任务队列中最大的任务个数 */
+    int iIdleTimeoutMs;  /* 空闲线程超时缩容时间(ms)，0=禁用缩容 */
 }T_ThreadPoolConfig;
 
 /**

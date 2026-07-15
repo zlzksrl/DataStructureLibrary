@@ -9,7 +9,7 @@ AR = arm-linux-gnueabihf-ar
 # 项目配置
 # ==============================================================================
 TARGET_Name        = FileWriter
-ProgramVER         = 1.1.0
+ProgramVER         = 1.2.0
 USERNAME           = zlzksrl
 # 用 ?= 使 CI/环境变量可 override：make LIBFILE_PATH=/opt/lib
 LIBFILE_PATH      ?= ~/zlzksrl/LinuxARM/Program/DataStructureLibrary/Library

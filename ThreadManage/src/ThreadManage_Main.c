@@ -524,7 +524,7 @@ int ThreadAPI_PrintThreadAttr(const char *sThreadName, pthread_t tThreadPid)
     }
 
     /* 定义属性变量 */
-    int istacksize = -1;        /* 栈大小（字节） */
+    int istacksize = 0;        /* 栈大小（字节） */
 
     int eDetachState;           /* 分离状态 */
     char *sDetachState = NULL;  /* 分离状态字符串描述 */
@@ -623,7 +623,7 @@ int ThreadAPI_PrintThreadAttr(const char *sThreadName, pthread_t tThreadPid)
     }
 
     /* 获取栈大小 */
-    ret = pthread_attr_getstacksize(&t_ThreadAttr, &istacksize);
+    ret = pthread_attr_getstacksize(&t_ThreadAttr, (unsigned int *)&istacksize);
     if (ret != 0) 
     {
         ThreadManage_printx("pthread_attr_getstacksize fail");
@@ -789,7 +789,7 @@ static int ThreadAPI_CreatePrintThreadAttr(pthread_attr_t *pt_ThreadAttr)
     }
 
     /* 获取栈大小 */
-    ret = pthread_attr_getstacksize(pt_ThreadAttr, &istacksize);
+    ret = pthread_attr_getstacksize(pt_ThreadAttr, (unsigned int *)&istacksize);
     if (ret != 0) 
     {
         ThreadManage_printx("pthread_attr_getstacksize fail");

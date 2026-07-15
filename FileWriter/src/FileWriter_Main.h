@@ -6,15 +6,15 @@
  *              外部用户通过 include/FileWriter.h 访问公共API。
  *
  * @author      zlzksrl
- * @Version     V1.1.0
- * @date        2026-07-12
+ * @Version     V1.2.0
+ * @date        2026-07-15
  * @copyright   copyright (C) 2026
  */
 
 /**
- * @date        2026-07-12
- * @Version     V1.1.0
- * @brief       创建文件
+ * @date        2026-07-15
+ * @Version     V1.2.0
+ * @brief       创建文件（V1.2：序号跨重启延续 + 降配批量清理）
  * @author      zlzksrl
  */
 #ifndef __FileWriter_Main_H__
