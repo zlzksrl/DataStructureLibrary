@@ -1,72 +1,153 @@
-# 工具链
-CC = arm-linux-gnueabihf-gcc
-
+# ==============================================================================
+# 工具链配置
+# ==============================================================================
+# 使用 ARM Linux 交叉编译工具链（针对 IMX6ULL 平台，ARM Cortex-A7）
+CC ?= arm-linux-gnueabihf-gcc
+CXX ?= arm-linux-gnueabihf-g++
+AR ?= arm-linux-gnueabihf-ar
+# ==============================================================================
 # 项目配置
+# ==============================================================================
 TARGET_Name        = KernelLinkedList
 ProgramVER         = 1.0.0
 USERNAME           = zlzksrl
-LIBFILE_PATH       = ~/zlzksrl/LinuxARM/Program/DataStructureLibrary/Library/
+MAKETIME           = $(shell date "+%G.%m.%d-%H.%M.%S")
+# 用 ?= 使 CI/环境变量可 override：make LIBFILE_PATH=/opt/lib
+LIBFILE_PATH      ?= ~/zlzksrl/LinuxARM/Program/DataStructureLibrary/Library
 
+# ==============================================================================
 # 安装路径
-INSTALL_PATH       = $(LIBFILE_PATH)/$(TARGET_Name)/
+# ==============================================================================
+# 本地安装路径（库文件和头文件安装到此目录）
+INSTALL_PATH    =  $(LIBFILE_PATH)/$(TARGET_Name)/
+# 远程部署目标（通过 scp 部署到目标开发板）
 INSTALLBOARD       = root@192.168.1.6:/usr/zlzksrl/app/$(TARGET_Name)/
 
-# 编译选项
-CFLAGS  = -g -Wall -Wextra
+# ==============================================================================
+# 依赖库路径（公共库目录）
+# ==============================================================================
 
-# 源文件
+# ==============================================================================
+# 编译选项
+# ==============================================================================
+# -g:          生成调试信息（GDB 调试用）
+# -Wall:       开启常见警告
+# -Wextra:     开启额外警告
+# -std=gnu11:  显式指定 C11 + GNU 扩展。V1.1 抗并发销毁依赖 <stdatomic.h>（C11），
+#              gnu11 同时打开 _GNU_SOURCE 保证 pthread/clock_gettime 等 POSIX 扩展可见。
+#              GCC 4.9+ 支持；用老工具链需自行调整。
+CFLAGS  = -g -Wall -Wextra -std=gnu11
+CFLAGS  := $(CFLAGS) -pthread
+
+# 位置无关代码编译选项（动态库必需）
+PIC_FLAGS = -fPIC
+
+##############链接选项###########################################################
+#####链接选项-开始#####
+#LDFLAGS :=$(LDFLAGS) -Wl,--start-group 
+# 链接选项：pthread + 依赖库
+LDFLAGS = -pthread
+
+
+
+
+
+#####链接选项-结束#####
+#LDFLAGS :=$(LDFLAGS) -Wl,--end-group
+# ==============================================================================
+# 源文件与目标文件
+# ==============================================================================
+# 库源文件（位于 ../src/ 目录）
+SOURCES     = ThreadQueue_Main.c
+# 测试主程序源文件（位于当前目录）
 MAIN_SOURCE = main.c
 
-# 目标文件
+
+# 目标文件（分离静态库和动态库的 .o 文件，避免 -fPIC 混用）
+STATIC_OBJS = $(addprefix obj_static/,$(notdir $(SOURCES:.c=.o)))
+SHARED_OBJS = $(addprefix obj_shared/,$(notdir $(SOURCES:.c=.o)))
 MAIN_OBJ    = $(MAIN_SOURCE:.c=.o)
 
-# 可执行文件
-TARGET_DATE    = $(TARGET_Name)_DebugPro$(shell date "+%Y%m%d").bin
-TARGET         = $(TARGET_Name)_DebugPro.bin
+# ==============================================================================
+# 输出文件
+# ==============================================================================
+# 静态库和动态库文件名
+STATIC_LIBNAME = lib$(TARGET_Name).a
+SHARED_LIBNAME = lib$(TARGET_Name).so
 
-#自动生成的工程信息
+# 可执行文件（带日期戳的版本和默认版本）
+TARGET_DATE    = $(TARGET_Name)_DebugPro$(shell date "+%Y%m%d").bin
+TARGET         = $(TARGET_Name)_DebugPro.bin 
+
+
+# 自动生成的头文件（包含编译时间戳信息）
+TARGET_MAKETIME_H  = ./../src/$(TARGET_Name)_Maketime.h
+
+# 自动生成的工程信息文件（包含库文件 MD5 校验）
 PROJECT_INFO     = ./ProjectInfo.txt
 
 
 # ==============================================================================
-MAKETIME      = $(shell date "+%G.%m.%d-%H.%M.%S")
-
-# ==============================================================================
 # 伪目标
-.PHONY: all clean install install_lib
+.PHONY: all clean install install_lib slib dlib app cleantime time
 
-all: app
+# ---- 默认目标: 构建静态库、动态库、可执行程序 ----
+all: time  app	
 	echo "PROJECT_MAKETIME $(USERNAME)-$(ProgramVER) at $(MAKETIME)" >  $(PROJECT_INFO)
-	md5sum $(TARGET) >> $(PROJECT_INFO)
 	cat $(PROJECT_INFO)
 	rm -f *.o  -rf
-# ==============================================================================
 
-# 可执行程序（纯头文件，无需链接库）
+# ================================================================================================================================
+# 时间头文件
+time:
+
+# ================================================================================================================================
+# 静态库
+slib: 
+# ==============================================================================
+# ---- 动态库构建 ----
+# -shared: 生成共享库, -fPIC: 位置无关代码
+dlib: 
+
+# ==============================================================================
+# ---- 可执行程序构建（链接静态库） ----
 app: $(MAIN_OBJ)
-	$(CC) $(CFLAGS) -o $(TARGET) $(MAIN_OBJ)
+	rm -f $(TARGET)
+	$(CC) $(CFLAGS) -o $(TARGET) $(MAIN_OBJ)  $(LDFLAGS)
 	@chmod 755 $(TARGET)
 
-# main.o 编译
-%.o: %.c ../include/KernelLinkedList.h
-	$(CC) $(CFLAGS) -c $< -o $@
+# main.o 单独编译（测试主程序）
+$(MAIN_OBJ): $(MAIN_SOURCE)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ==============================================================================
-# 清理
+
+# ==============================================================================
+# ---- 清理目标 ----
 clean:
-	rm -f *.bin
-	rm -f *.o
+	rm -f *.bin  -rf
+	rm -f *.o  -rf
+
+
 	rm -f $(TARGET)
 	rm -f $(PROJECT_INFO)
+# ==============================================================================
+# 清理
+cleantime:
 	
-# 安装可执行文件
-install:app
-	scp $(TARGET) $(INSTALLBOARD)
-	# 安装库文件
+	
+# ==============================================================================	
 
-install_lib:
+# ---- 安装可执行文件到目标开发板（通过 scp） ----
+install:app
+	scp $(TARGET) $(INSTALLBOARD);
+# ==============================================================================
+# 安装库文件
+install_lib:slib dlib
 	rm $(INSTALL_PATH) -rf
 	mkdir -p $(INSTALL_PATH)
 	mkdir -p $(INSTALL_PATH)include/
+
+
 	cp ../include/* $(INSTALL_PATH)include/
 	cp $(PROJECT_INFO) $(INSTALL_PATH)

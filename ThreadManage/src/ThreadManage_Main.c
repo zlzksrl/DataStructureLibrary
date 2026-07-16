@@ -623,7 +623,7 @@ int ThreadAPI_PrintThreadAttr(const char *sThreadName, pthread_t tThreadPid)
     }
 
     /* 获取栈大小 */
-    ret = pthread_attr_getstacksize(&t_ThreadAttr, (unsigned int *)&istacksize);
+    ret = pthread_attr_getstacksize(&t_ThreadAttr, (size_t *)&istacksize);
     if (ret != 0) 
     {
         ThreadManage_printx("pthread_attr_getstacksize fail");
@@ -789,7 +789,7 @@ static int ThreadAPI_CreatePrintThreadAttr(pthread_attr_t *pt_ThreadAttr)
     }
 
     /* 获取栈大小 */
-    ret = pthread_attr_getstacksize(pt_ThreadAttr, (unsigned int *)&istacksize);
+    ret = pthread_attr_getstacksize(pt_ThreadAttr, (size_t * )&istacksize);
     if (ret != 0) 
     {
         ThreadManage_printx("pthread_attr_getstacksize fail");

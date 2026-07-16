@@ -2,21 +2,28 @@
 # 工具链配置
 # ==============================================================================
 CC = arm-linux-gnueabihf-gcc
+CXX = arm-linux-gnueabihf-g++ 
 AR = arm-linux-gnueabihf-ar
-
+#CC  = /opt/tool/5718_3358_sdk08_devkit/sysroots/x86_64-arago-linux/usr/bin/arm-none-linux-gnueabihf-gcc 
+#CXX = /opt/tool/5718_3358_sdk08_devkit/sysroots/x86_64-arago-linux/usr/bin/arm-none-linux-gnueabihf-g++ 
+#AR  = /opt/tool/5718_3358_sdk08_devkit/sysroots/x86_64-arago-linux/usr/bin/arm-none-linux-gnueabihf-ar  
+#CC = gcc
+#CXX = g++ 
+#AR = ar
 # ==============================================================================
 # 项目配置
 # ==============================================================================
 TARGET_Name        = DataStructureToolLibrary
 ProgramVER         = 1.0.0
 USERNAME           = zlzksrl
-
+MAKETIME           = $(shell date "+%G.%m.%d-%H.%M.%S")
 # 本 Makefile 位于 <root>/Library/DataStructureToolLibrary/debug/，向上 3 层为工程根目录
-ROOT_DIR           = ../../..
+#ROOT_DIR           = /opt/pipe/A-1000i/shutan/Program_Ver2/14_A-1000i_SensorWeldLayerParamPlan/10_DataStructureToolLibrary
+ROOT_DIR			= ../../..
 
 # 安装目录：Library/DataStructureToolLibrary/{StaticLib,sharedLib,include}
-INSTALL_PATH       = ..
-
+#INSTALL_PATH       = /opt/pipe/A-1000i/shutan/Program_Ver2/14_A-1000i_SensorWeldLayerParamPlan/10_DataStructureToolLibrary/Library/DataStructureToolLibrary
+INSTALL_PATH        = ../
 # ==============================================================================
 # 子工程列表
 # ------------------------------------------------------------------------------
@@ -42,8 +49,8 @@ SUBPROJECTS = KernelLinkedList  \
               RedBlackTree      \
               MemoryPool        \
               ThreadManage      \
-              SoftTimer         \
-              FileWriter
+              FileWriter        \
+              SoftTimer         
 
 # 传给各子工程 Makefile 的 LIBFILE_PATH（指向本地 Library/ 目录的绝对路径），
 # 子工程 Makefile 中用 ?= 声明，因此可被外部覆盖。
@@ -144,17 +151,17 @@ clean:
 AllPro:
 	@for p in $(SUBPROJECTS); do \
 	    echo "==== [AllPro] $$p ===="; \
-	    $(MAKE) -C $(ROOT_DIR)/$$p/debug all LIBFILE_PATH=$(LIB_LOCAL_PATH) || exit 1; \
+	    $(MAKE) -C $(ROOT_DIR)/$$p/debug all install_lib LIBFILE_PATH=$(LIB_LOCAL_PATH) CC=$(CC) CXX=$(CXX) AR=$(AR) || exit 1; \
 	done
 
 install_AllPro:
 	@for p in $(SUBPROJECTS); do \
 	    echo "==== [install_AllPro] $$p ===="; \
-	    $(MAKE) -C $(ROOT_DIR)/$$p/debug install_lib LIBFILE_PATH=$(LIB_LOCAL_PATH) || exit 1; \
+	    $(MAKE) -C $(ROOT_DIR)/$$p/debug install_lib LIBFILE_PATH=$(LIB_LOCAL_PATH) CC=$(CC) CXX=$(CXX) AR=$(AR)|| exit 1; \
 	done
 
 clean_AllPro:
 	@for p in $(SUBPROJECTS); do \
 	    echo "==== [clean_AllPro] $$p ===="; \
-	    $(MAKE) -C $(ROOT_DIR)/$$p/debug clean LIBFILE_PATH=$(LIB_LOCAL_PATH) || exit 1; \
+	    $(MAKE) -C $(ROOT_DIR)/$$p/debug clean LIBFILE_PATH=$(LIB_LOCAL_PATH) CC=$(CC) CXX=$(CXX) AR=$(AR)|| exit 1; \
 	done

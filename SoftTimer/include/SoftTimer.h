@@ -216,6 +216,26 @@ typedef struct T_SOFTTIMERSTATS
  */
 int SoftTimerAPI_Init(T_SoftTimerMgr **ppt_Mgr, T_SoftTimerConfig t_Config);
 
+
+
+/**
+ * @func         SoftTimerAPI_QuickInit
+ * @brief        创建软件定时器管理器-内部调用SoftTimerAPI_Init,默认一些常规使用的配置
+ * @details      同 SoftTimerAPI_Init
+ T_SoftTimerConfig  t_Config = {.sMgrName=sMgrName, .iMinNum=2, .iMaxNum=5,
+                                .iQueueMaxSize=32, .iIdleTimeoutMs=5000,.iSchedPriority=0 };
+ * @param[in]    sMgrName:  定时器的名称
+ * @param[out]   无
+ * @return       T_SoftTimerMgr *pt_SoftTimerMgr
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，并且是定时器管理器的句柄
+ * @author       zlzksrl
+ * @date         2026-07-13
+ * @Version      V1.0.0
+ */
+
+T_SoftTimerMgr *SoftTimerAPI_QuickInit(char sMgrName[32]);
+
 /**
  * @func         SoftTimerAPI_Destroy
  * @brief        销毁管理器，释放所有资源
@@ -269,6 +289,39 @@ int SoftTimerAPI_Destroy(T_SoftTimerMgr **ppt_Mgr);
 int SoftTimerAPI_SetAlarm(T_SoftTimerMgr *pt_Mgr,
                           T_SoftTimerAlarm t_Alarm,
                           T_SoftTimerHandle **ppt_Handle);
+
+/**
+ * @func         SoftTimerAPI_QuickSetAlarm
+ * @brief        注册一个定时器-内部调用 SoftTimerAPI_SetAlarm,默认一些常规使用的配置
+ * @details      同 SoftTimerAPI_SetAlarm
+ T_SoftTimerAlarm   t_SoftTimerAlarm   = {   .cb=cb, 
+                                             .user_ctx=user_ctx
+                                             .iFirstDelayMs=iFirstDelayMs,
+                                             .iPeriodMs=iPeriodMs,
+                                             .ePeriodMode=SOFTTIMER_PERIOD_FROM_END,
+                                             .sTimerName="QuickSetAlarm" };
+
+ * @param[in]        pt_Mgr:      管理器句柄
+                     cb             < 用户回调，不能为 NULL
+                    *user_ctx       < 传给 cb 的上下文，可为 NULL
+                     iFirstDelayMs  < 首次触发延迟(ms)，>=0 
+                     iPeriodMs      < 周期(ms)，0=单次；>0=周期
+ 
+ * @param[out]   无
+ * @return       T_SoftTimerHandle *pt_SoftTimerHandle
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，并且是定时器的句柄
+ * @author       zlzksrl
+ * @date         2026-07-13
+ * @Version      V1.0.0
+ */
+T_SoftTimerHandle *SoftTimerAPI_QuickSetAlarm(T_SoftTimerMgr *pt_Mgr
+                                                ,SoftTimerCb  cb             /**< 用户回调，不能为 NULL */
+                                                ,void        *user_ctx       /**< 传给 cb 的上下文，可为 NULL */
+                                                ,int          iFirstDelayMs  /**< 首次触发延迟(ms)，>=0 */
+                                                ,int          iPeriodMs      /**< 周期(ms)，0=单次；>0=周期 */
+                                                ,char         sTimerName[32]
+                                                );
 
 /**
  * @func         SoftTimerAPI_Delete

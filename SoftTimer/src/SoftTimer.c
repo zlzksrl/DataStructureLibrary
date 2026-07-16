@@ -615,7 +615,42 @@ int SoftTimerAPI_Init(T_SoftTimerMgr **ppt_Mgr, T_SoftTimerConfig t_Config)
     *ppt_Mgr = NULL;
     return iRet;
 }
+/**
+ * @func         SoftTimerAPI_QuickInit
+ * @brief        创建软件定时器管理器-内部调用SoftTimerAPI_Init,默认一些常规使用的配置
+ * @details      同 SoftTimerAPI_Init
+ T_SoftTimerConfig  t_Config = {.sMgrName=sMgrName, .iMinNum=2, .iMaxNum=5,
+                                .iQueueMaxSize=32, .iIdleTimeoutMs=5000,.iSchedPriority=0 };
+ * @param[in]    sMgrName:  定时器的名称
+ * @param[out]   无
+ * @return       T_SoftTimerMgr *pt_SoftTimerMgr
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，并且是定时器管理器的句柄
+ * @author       zlzksrl
+ * @date         2026-07-13
+ * @Version      V1.0.0
+ */
 
+T_SoftTimerMgr *SoftTimerAPI_QuickInit(char sMgrName[32])
+{
+    int ret = 0;
+    T_SoftTimerMgr *pt_SoftTimerMgr = NULL;
+    T_SoftTimerConfig t_SoftTimerConfig;
+    memset(&t_SoftTimerConfig,0,sizeof(T_SoftTimerConfig));
+    strncpy(t_SoftTimerConfig.sMgrName,sMgrName,32);
+    sMgrName[31] = '\0';
+    t_SoftTimerConfig.iMinNum = 2;
+    t_SoftTimerConfig.iMaxNum = 5;
+    t_SoftTimerConfig.iQueueMaxSize = 32;
+    t_SoftTimerConfig.iIdleTimeoutMs = 5*1000;
+    t_SoftTimerConfig.iSchedPriority = 0;
+    ret = SoftTimerAPI_Init(&pt_SoftTimerMgr, t_SoftTimerConfig);
+    if(ret < 0 || NULL == pt_SoftTimerMgr)
+    {
+        return NULL;
+    } 
+    return pt_SoftTimerMgr;
+}
 /**
  * @func         SoftTimerAPI_Destroy
  * @brief        销毁管理器
@@ -821,6 +856,56 @@ int SoftTimerAPI_SetAlarm(T_SoftTimerMgr *pt_Mgr,
     *ppt_Handle = handle;
     pthread_mutex_unlock(&pt_Mgr->mux);
     return 0;
+}
+/**
+ * @func         SoftTimerAPI_QuickSetAlarm
+ * @brief        注册一个定时器-内部调用 SoftTimerAPI_SetAlarm,默认一些常规使用的配置
+ * @details      同 SoftTimerAPI_SetAlarm
+ T_SoftTimerAlarm   t_SoftTimerAlarm   = {   .cb=cb, 
+                                             .user_ctx=user_ctx
+                                             .iFirstDelayMs=iFirstDelayMs,
+                                             .iPeriodMs=iPeriodMs,
+                                             .ePeriodMode=SOFTTIMER_PERIOD_FROM_END,
+                                             .sTimerName="QuickSetAlarm" };
+
+ * @param[in]        pt_Mgr:      管理器句柄
+                     cb             < 用户回调，不能为 NULL
+                    *user_ctx       < 传给 cb 的上下文，可为 NULL
+                     iFirstDelayMs  < 首次触发延迟(ms)，>=0 
+                     iPeriodMs      < 周期(ms)，0=单次；>0=周期
+                     char         sTimerName[32]
+ * @param[out]   无
+ * @return       T_SoftTimerHandle *pt_SoftTimerHandle
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，并且是定时器的句柄
+ * @author       zlzksrl
+ * @date         2026-07-13
+ * @Version      V1.0.0
+ */
+T_SoftTimerHandle *SoftTimerAPI_QuickSetAlarm(T_SoftTimerMgr *pt_Mgr
+                                                ,SoftTimerCb  cb             /**< 用户回调，不能为 NULL */
+                                                ,void        *user_ctx       /**< 传给 cb 的上下文，可为 NULL */
+                                                ,int          iFirstDelayMs  /**< 首次触发延迟(ms)，>=0 */
+                                                ,int          iPeriodMs      /**< 周期(ms)，0=单次；>0=周期 */
+                                                ,char         sTimerName[32]
+                                                )
+{
+    int ret = -1;
+    T_SoftTimerHandle *pt_SoftTimerHandle = NULL;
+    T_SoftTimerAlarm t_SoftTimerAlarm;
+    memset(&t_SoftTimerAlarm,0,sizeof(T_SoftTimerAlarm));
+    t_SoftTimerAlarm.cb            = cb;
+    t_SoftTimerAlarm.user_ctx      = user_ctx;
+    t_SoftTimerAlarm.iFirstDelayMs = iFirstDelayMs;
+    t_SoftTimerAlarm.iPeriodMs     = iPeriodMs;
+    strncpy(t_SoftTimerAlarm.sTimerName,sTimerName,32);
+    t_SoftTimerAlarm.sTimerName[31] = '\0';    
+    ret = SoftTimerAPI_SetAlarm(pt_Mgr, t_SoftTimerAlarm, &pt_SoftTimerHandle);
+    if(ret < 0 || NULL == pt_SoftTimerHandle)
+    {
+        return NULL;
+    }
+    return pt_SoftTimerHandle;
 }
 
 /* ========================== 调度线程 ========================== */

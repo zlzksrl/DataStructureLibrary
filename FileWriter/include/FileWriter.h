@@ -225,6 +225,123 @@ typedef struct T_FILEWRITERCONFIG
  */
 int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg);
 
+
+/**
+ * @func         FileWriterAPI_QuickInitLog
+ * @brief        FileWriterAPI-初始化异步文件写入实例-快速开始Log文档
+ * @details      同 FileWriterAPI_Init
+ *              T_FileWriterConfig cfg = {
+ *                  .dir_path = dir_path,
+ *                  .date_subdir_prefix = date_subdir_prefix,
+ *                  .file_prefix = file_prefix,
+                    .file_type =  FILEWRITER_TYPE_LOG 
+ *                  .file_ext = ".log",
+ *                  .max_files = 0,
+ *                  .max_file_size = 0,      
+ *                  .auto_rotate_daily = 1, //跨日自动轮转
+ *                  .thread_priority = 30,
+ *                  .timestamp = 1,         //行首写入时间戳
+ *                  .flush_bytes = 8*1024,
+ *                  .flush_ms = flush_ms,
+ *                  .buffer_capacity = 64*1024
+ *              };
+ * @param[in]    char     dir_path[256];          < 写入根目录（绝对或相对），自动创建多级 
+                 char     date_subdir_prefix[16]; < 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 
+                 char     file_prefix[64];        < 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下
+                 int      flush_ms;               < 定时写盘周期(ms，如 100) 
+ * @param[out]   
+ * @return       T_FileWriter *pt_FileWriter
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，日志句柄
+ * @warning      
+ * @author       zlzksrl
+ * @date         2026-07-11
+ * @Version      V1.0.0
+ */
+T_FileWriter * FileWriterAPI_QuickInitLog(    
+                                                 char     dir_path[256]          /**< 写入根目录（绝对或相对），自动创建多级 */
+                                                ,char     date_subdir_prefix[16] /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+                                                ,char     file_prefix[64]        /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+                                                ,int      flush_ms               /**< 定时写盘周期(ms，如 100) */
+                                                );
+
+/**
+ * @func         FileWriterAPI_QuickInitCSV
+ * @brief        FileWriterAPI-初始化异步文件写入实例-快速开始CSV文档
+ * @details      同 FileWriterAPI_Init
+ *              T_FileWriterConfig cfg = {
+ *                  .dir_path = dir_path,
+ *                  .date_subdir_prefix = date_subdir_prefix,
+ *                  .file_prefix = file_prefix,
+                    .file_type =  FILEWRITER_TYPE_CSV 
+ *                  .file_ext = ".csv",
+ *                  .max_files = 0,
+ *                  .max_file_size = 0,      
+ *                  .auto_rotate_daily = 0, //不会自动轮转
+ *                  .thread_priority = 30,
+ *                  .timestamp = 0,         //不会写入时间戳
+ *                  .flush_bytes = 8*1024,
+ *                  .flush_ms = flush_ms,
+ *                  .buffer_capacity = 64*1024
+ *              };
+ * @param[in]    char     dir_path[256];          < 写入根目录（绝对或相对），自动创建多级 
+                 char     date_subdir_prefix[16]; < 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 
+                 char     file_prefix[64];        < 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下
+                 int      flush_ms;               < 定时写盘周期(ms，如 100) 
+ * @param[out]   
+ * @return       T_FileWriter *pt_FileWriter
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，日志句柄
+ * @warning      
+ * @author       zlzksrl
+ * @date         2026-07-11
+ * @Version      V1.0.0
+ */
+T_FileWriter * FileWriterAPI_QuickInitCSV(    
+                                                 char     dir_path[256]          /**< 写入根目录（绝对或相对），自动创建多级 */
+                                                ,char     date_subdir_prefix[16] /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+                                                ,char     file_prefix[64]        /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+                                                ,int      flush_ms               /**< 定时写盘周期(ms，如 100) */
+                                                );
+/**
+ * @func         FileWriterAPI_QuickInitBin
+ * @brief        FileWriterAPI-初始化异步文件写入实例-快速开始写bin文件
+ * @details      同 FileWriterAPI_Init
+ *              T_FileWriterConfig cfg = {
+ *                  .dir_path = dir_path,
+ *                  .date_subdir_prefix = date_subdir_prefix,
+ *                  .file_prefix = file_prefix,
+                    .file_type =  FILEWRITER_TYPE_BIN 
+ *                  .file_ext = ".bin",
+ *                  .max_files = 0,
+ *                  .max_file_size = 0,      
+ *                  .auto_rotate_daily = 0, //不会自动轮转
+ *                  .thread_priority = 30,
+ *                  .timestamp = 0,         //不会写入时间戳
+ *                  .flush_bytes = 8*1024,
+ *                  .flush_ms = flush_ms,
+ *                  .buffer_capacity = 64*1024
+ *              };
+ * @param[in]    char     dir_path[256];          < 写入根目录（绝对或相对），自动创建多级 
+                 char     date_subdir_prefix[16]; < 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 
+                 char     file_prefix[64];        < 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下
+                 int      flush_ms;               < 定时写盘周期(ms，如 100) 
+ * @param[out]   
+ * @return       T_FileWriter *pt_FileWriter
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，日志句柄
+ * @warning      
+ * @author       zlzksrl
+ * @date         2026-07-11
+ * @Version      V1.0.0
+ */
+T_FileWriter * FileWriterAPI_QuickInitBin(    
+                                                 char     dir_path[256]          /**< 写入根目录（绝对或相对），自动创建多级 */
+                                                ,char     date_subdir_prefix[16] /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+                                                ,char     file_prefix[64]        /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+                                                ,int      flush_ms               /**< 定时写盘周期(ms，如 100) */
+                                                );
+
 /**
  * @func         FileWriterAPI_Destroy
  * @brief        FileWriterAPI-销毁实例（一步到位：优雅关闭 + 释放资源）

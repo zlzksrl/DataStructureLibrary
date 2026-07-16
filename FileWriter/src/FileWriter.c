@@ -1150,6 +1150,225 @@ int FileWriterAPI_Init(T_FileWriter **pp, const T_FileWriterConfig *cfg)
     *pp = pt;
     return 0;
 }
+/**
+ * @func         FileWriterAPI_QuickInitLog
+ * @brief        FileWriterAPI-初始化异步文件写入实例-快速开始Log文档
+ * @details      同 FileWriterAPI_Init
+ *              T_FileWriterConfig cfg = {
+ *                  .dir_path = dir_path,
+ *                  .date_subdir_prefix = date_subdir_prefix,
+ *                  .file_prefix = file_prefix,
+                    .file_type =  FILEWRITER_TYPE_LOG 
+ *                  .file_ext = ".log",
+ *                  .max_files = 0,
+ *                  .max_file_size = 0,      
+ *                  .auto_rotate_daily = 1, //跨日自动轮转
+ *                  .thread_priority = 30,
+ *                  .timestamp = 1,         //行首写入时间戳
+ *                  .flush_bytes = 8*1024,
+ *                  .flush_ms = flush_ms,
+ *                  .buffer_capacity = 64*1024
+                    .destroy_wait_ms = 500
+ *              };
+ * @param[in]    char     dir_path[256];          < 写入根目录（绝对或相对），自动创建多级 
+                 char     date_subdir_prefix[16]; < 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 
+                 char     file_prefix[64];        < 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下
+                 int      flush_ms;               < 定时写盘周期(ms，如 100) 
+ * @param[out]   
+ * @return       T_FileWriter *pt_FileWriter
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，日志句柄
+ * @warning      
+ * @author       zlzksrl
+ * @date         2026-07-11
+ * @Version      V1.0.0
+ */
+T_FileWriter * FileWriterAPI_QuickInitLog(    
+                                                 char     dir_path[256]          /**< 写入根目录（绝对或相对），自动创建多级 */
+                                                ,char     date_subdir_prefix[16] /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+                                                ,char     file_prefix[64]        /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+                                                ,int      flush_ms               /**< 定时写盘周期(ms，如 100) */
+                                                )
+{
+    int ret = 0;
+    T_FileWriter *pt_FileWriter = NULL;
+    T_FileWriterConfig t_FileWriterConfig;
+    memset(&t_FileWriterConfig,0,sizeof(T_FileWriterConfig));
+    strncpy(t_FileWriterConfig.dir_path,dir_path,256);                      /**< 写入根目录（绝对或相对），自动创建多级 */
+    strncpy(t_FileWriterConfig.date_subdir_prefix,date_subdir_prefix,16);   /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+    strncpy(t_FileWriterConfig.file_prefix,file_prefix,64);                 /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+    t_FileWriterConfig.file_type = FILEWRITER_TYPE_LOG;                     /**< 文件类型枚举(TXT/LOG/CSV/BIN)；file_ext 非空时优先用 file_ext */
+    /* ---- 文件轮转 ---- */
+    t_FileWriterConfig.max_files = 0;              
+    t_FileWriterConfig.max_file_size       = 0;           /**< 单文件最大字节，0=不限制；>0 达此大小自动轮转。1G=1024*1024*1024 */
+    t_FileWriterConfig.auto_rotate_daily   = 1;           /**< 1=跨日自动轮转（建新日期目录+新文件）；0=不自动 */
+
+    /* ---- 线程 ---- */
+    t_FileWriterConfig.thread_priority     = 30;          /**< 消费线程 SCHED_RR 优先级(1~99，如 20)；0=用默认 */
+
+    /* ---- 写入行为 ---- */
+    t_FileWriterConfig.timestamp           = 1;           /**< 1=每行前加时间戳 [HH:MM:SS.mmmmmm] ；0=不加 */
+    t_FileWriterConfig.flush_bytes         = 8*1024;      /**< 攒批字节阈值(如 4096)，达此值触发写盘 */
+    t_FileWriterConfig.flush_ms            = flush_ms;    /**< 定时写盘周期(ms，如 100) */
+    t_FileWriterConfig.buffer_capacity     = 64*1024;     /**< StreamBuffer 容量(字节，须2的幂，如65536) */
+
+    /* ---- 生命周期 ---- */
+    t_FileWriterConfig.destroy_wait_ms     = 0;           /**< Destroy 等 in-flight Writer 出保护区的超时(ms)，<=0=默认 500ms。
+                                          超时后 Destroy 返回，实例内存延迟到最后一个 Writer 退出时释放，
+                                          文件数据已在同步阶段完整落盘。 */
+    ret = FileWriterAPI_Init(&pt_FileWriter,&t_FileWriterConfig);
+    if(ret < 0 || NULL == pt_FileWriter)
+    {
+        return NULL;
+    }
+    return pt_FileWriter;
+}
+
+/**
+ * @func         FileWriterAPI_QuickInitCSV
+ * @brief        FileWriterAPI-初始化异步文件写入实例-快速开始CSV文档
+ * @details      同 FileWriterAPI_Init
+ *              T_FileWriterConfig cfg = {
+ *                  .dir_path = dir_path,
+ *                  .date_subdir_prefix = date_subdir_prefix,
+ *                  .file_prefix = file_prefix,
+                    .file_type =  FILEWRITER_TYPE_CSV 
+ *                  .file_ext = ".csv",
+ *                  .max_files = 0,
+ *                  .max_file_size = 0,      
+ *                  .auto_rotate_daily = 0, //不会自动轮转
+ *                  .thread_priority = 30,
+ *                  .timestamp = 0,         //不会写入时间戳
+ *                  .flush_bytes = 8*1024,
+ *                  .flush_ms = flush_ms,
+ *                  .buffer_capacity = 64*1024
+ *              };
+ * @param[in]    char     dir_path[256];          < 写入根目录（绝对或相对），自动创建多级 
+                 char     date_subdir_prefix[16]; < 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 
+                 char     file_prefix[64];        < 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下
+                 int      flush_ms;               < 定时写盘周期(ms，如 100) 
+ * @param[out]   
+ * @return       T_FileWriter *pt_FileWriter
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，日志句柄
+ * @warning      
+ * @author       zlzksrl
+ * @date         2026-07-11
+ * @Version      V1.0.0
+ */
+T_FileWriter * FileWriterAPI_QuickInitCSV(    
+                                                 char     dir_path[256]          /**< 写入根目录（绝对或相对），自动创建多级 */
+                                                ,char     date_subdir_prefix[16] /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+                                                ,char     file_prefix[64]        /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+                                                ,int      flush_ms               /**< 定时写盘周期(ms，如 100) */
+                                                )
+{
+    int ret = 0;
+    T_FileWriter *pt_FileWriter = NULL;
+    T_FileWriterConfig t_FileWriterConfig;
+    memset(&t_FileWriterConfig,0,sizeof(T_FileWriterConfig));
+    strncpy(t_FileWriterConfig.dir_path,dir_path,256);                      /**< 写入根目录（绝对或相对），自动创建多级 */
+    strncpy(t_FileWriterConfig.date_subdir_prefix,date_subdir_prefix,16);   /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+    strncpy(t_FileWriterConfig.file_prefix,file_prefix,64);                 /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+    t_FileWriterConfig.file_type = FILEWRITER_TYPE_CSV;                     /**< 文件类型枚举(TXT/LOG/CSV/BIN)；file_ext 非空时优先用 file_ext */
+    /* ---- 文件轮转 ---- */
+    t_FileWriterConfig.max_files = 0;              
+    t_FileWriterConfig.max_file_size       = 0;           /**< 单文件最大字节，0=不限制；>0 达此大小自动轮转。1G=1024*1024*1024 */
+    t_FileWriterConfig.auto_rotate_daily   = 0;           /**< 1=跨日自动轮转（建新日期目录+新文件）；0=不自动 */
+
+    /* ---- 线程 ---- */
+    t_FileWriterConfig.thread_priority     = 30;          /**< 消费线程 SCHED_RR 优先级(1~99，如 20)；0=用默认 */
+
+    /* ---- 写入行为 ---- */
+    t_FileWriterConfig.timestamp           = 0;           /**< 1=每行前加时间戳 [HH:MM:SS.mmmmmm] ；0=不加 */
+    t_FileWriterConfig.flush_bytes         = 8*1024;      /**< 攒批字节阈值(如 4096)，达此值触发写盘 */
+    t_FileWriterConfig.flush_ms            = flush_ms;    /**< 定时写盘周期(ms，如 100) */
+    t_FileWriterConfig.buffer_capacity     = 64*1024;     /**< StreamBuffer 容量(字节，须2的幂，如65536) */
+
+    /* ---- 生命周期 ---- */
+    t_FileWriterConfig.destroy_wait_ms     = 0;           /**< Destroy 等 in-flight Writer 出保护区的超时(ms)，<=0=默认 500ms。
+                                          超时后 Destroy 返回，实例内存延迟到最后一个 Writer 退出时释放，
+                                          文件数据已在同步阶段完整落盘。 */
+    ret = FileWriterAPI_Init(&pt_FileWriter,&t_FileWriterConfig);
+    if(ret < 0 || NULL == pt_FileWriter)
+    {
+        return NULL;
+    }
+    return pt_FileWriter;
+}
+/**
+ * @func         FileWriterAPI_QuickInitBin
+ * @brief        FileWriterAPI-初始化异步文件写入实例-快速开始写bin文件
+ * @details      同 FileWriterAPI_Init
+ *              T_FileWriterConfig cfg = {
+ *                  .dir_path = dir_path,
+ *                  .date_subdir_prefix = date_subdir_prefix,
+ *                  .file_prefix = file_prefix,
+                    .file_type =  FILEWRITER_TYPE_BIN 
+ *                  .file_ext = ".bin",
+ *                  .max_files = 0,
+ *                  .max_file_size = 0,      
+ *                  .auto_rotate_daily = 0, //不会自动轮转
+ *                  .thread_priority = 30,
+ *                  .timestamp = 0,         //不会写入时间戳
+ *                  .flush_bytes = 8*1024,
+ *                  .flush_ms = flush_ms,
+ *                  .buffer_capacity = 64*1024
+ *              };
+ * @param[in]    char     dir_path[256];          < 写入根目录（绝对或相对），自动创建多级 
+                 char     date_subdir_prefix[16]; < 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 
+                 char     file_prefix[64];        < 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下
+                 int      flush_ms;               < 定时写盘周期(ms，如 100) 
+ * @param[out]   
+ * @return       T_FileWriter *pt_FileWriter
+ * @retval       NULL:   初始化失败
+ * @retval       非NULL:  初始化成功，日志句柄
+ * @warning      
+ * @author       zlzksrl
+ * @date         2026-07-11
+ * @Version      V1.0.0
+ */
+T_FileWriter * FileWriterAPI_QuickInitBin(    
+                                                 char     dir_path[256]          /**< 写入根目录（绝对或相对），自动创建多级 */
+                                                ,char     date_subdir_prefix[16] /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+                                                ,char     file_prefix[64]        /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+                                                ,int      flush_ms               /**< 定时写盘周期(ms，如 100) */
+                                                )
+{
+    int ret = 0;
+    T_FileWriter *pt_FileWriter = NULL;
+    T_FileWriterConfig t_FileWriterConfig;
+    memset(&t_FileWriterConfig,0,sizeof(T_FileWriterConfig));
+    strncpy(t_FileWriterConfig.dir_path,dir_path,256);                      /**< 写入根目录（绝对或相对），自动创建多级 */
+    strncpy(t_FileWriterConfig.date_subdir_prefix,date_subdir_prefix,16);   /**< 日期子目录前缀，如 "X" → /log/X2026_07_11/；空串=不分日期目录 */
+    strncpy(t_FileWriterConfig.file_prefix,file_prefix,64);                 /**< 文件名前缀，可含子路径如 "sensor/sensor1"；不含"/"则文件直接在日期目录下 */
+    t_FileWriterConfig.file_type = FILEWRITER_TYPE_BIN;                     /**< 文件类型枚举(TXT/LOG/CSV/BIN)；file_ext 非空时优先用 file_ext */
+    /* ---- 文件轮转 ---- */
+    t_FileWriterConfig.max_files = 0;              
+    t_FileWriterConfig.max_file_size       = 0;           /**< 单文件最大字节，0=不限制；>0 达此大小自动轮转。1G=1024*1024*1024 */
+    t_FileWriterConfig.auto_rotate_daily   = 0;           /**< 1=跨日自动轮转（建新日期目录+新文件）；0=不自动 */
+
+    /* ---- 线程 ---- */
+    t_FileWriterConfig.thread_priority     = 30;          /**< 消费线程 SCHED_RR 优先级(1~99，如 20)；0=用默认 */
+
+    /* ---- 写入行为 ---- */
+    t_FileWriterConfig.timestamp           = 0;           /**< 1=每行前加时间戳 [HH:MM:SS.mmmmmm] ；0=不加 */
+    t_FileWriterConfig.flush_bytes         = 8*1024;      /**< 攒批字节阈值(如 4096)，达此值触发写盘 */
+    t_FileWriterConfig.flush_ms            = flush_ms;    /**< 定时写盘周期(ms，如 100) */
+    t_FileWriterConfig.buffer_capacity     = 64*1024;     /**< StreamBuffer 容量(字节，须2的幂，如65536) */
+
+    /* ---- 生命周期 ---- */
+    t_FileWriterConfig.destroy_wait_ms     = 0;           /**< Destroy 等 in-flight Writer 出保护区的超时(ms)，<=0=默认 500ms。
+                                          超时后 Destroy 返回，实例内存延迟到最后一个 Writer 退出时释放，
+                                          文件数据已在同步阶段完整落盘。 */
+    ret = FileWriterAPI_Init(&pt_FileWriter,&t_FileWriterConfig);
+    if(ret < 0 || NULL == pt_FileWriter)
+    {
+        return NULL;
+    }
+    return pt_FileWriter;
+}
+
 
 /**
  * @func         fw_final_free
